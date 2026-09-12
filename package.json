@@ -1,0 +1,31 @@
+{
+  "name": "laravel-cloud-axi",
+  "version": "0.1.0",
+  "description": "An agent-focused CLI for Laravel Cloud operations",
+  "type": "module",
+  "bin": {
+    "laravel-cloud-axi": "bin/laravel-cloud-axi.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skills",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "skill": "node scripts/skill.js",
+    "check": "node scripts/skill.js --check && node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martin-ro/laravel-cloud-axi.git"
+  },
+  "dependencies": {
+    "@toon-format/toon": "2.3.1",
+    "axi-sdk-js": "0.1.11"
+  }
+}
