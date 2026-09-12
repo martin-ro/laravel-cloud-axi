@@ -281,8 +281,12 @@ export async function execute(command, args, runtime) {
     return present({ [deploymentLogs ? 'logs' : command]: pick(data, chosen), ...(deploymentLogs ? { status: response.meta?.deployment_status } : {}) }, parsed.flags);
   }
   if (command === 'auth') {
-    const parsed = parse(args, 'auth', {}, 0, 'Check the organization for LARAVEL_CLOUD_TOKEN. No login prompts or stored tokens.');
-    return parsed.help ?? present({ organization: resource((await runtime.client.request('meta/organization')).data) });
+    if (['login', 'logout'].includes(args[0])) usage('The official Cloud CLI manages login and credentials.', ['Run `cloud auth` to log in.', 'laravel-cloud-axi auth --help']);
+    if (args[0] === 'status') args.shift();
+    const parsed = parse(args, 'auth', {}, 0, 'Check credential source and organization. Run cloud auth for browser login; the official Cloud CLI owns credential storage. Fallback: LARAVEL_CLOUD_API_TOKEN in the environment, then .env.');
+    if (parsed.help) return parsed.help;
+    const organization = resource((await runtime.client.request('meta/organization')).data);
+    return present({ ...runtime.client.authInfo, organization });
   }
   if (command === 'usage') {
     const parsed = parse(args, 'usage', { ...READ, period: '0=current, 1=previous, 2 or 3; default: 0', env: 'Optional environment ID; default: entire organization' }, 0, 'Read billing totals in integer cents.');
@@ -300,10 +304,11 @@ export async function execute(command, args, runtime) {
     const app = id(parsed.flags.app, '--app');
     const env = id(parsed.flags.env, '--env');
     const current = context(runtime.cwd);
-    await runtime.client.request(`applications/${app}`);
+    await runtime.client.request(`applications/${app}`, { ignoreProjectOrganization: true });
     const environment = resource((await runtime.client.request(`environments/${env}?include=application`)).data);
     if (environment.application_id !== app) usage('The environment does not belong to this application.');
-    return { changed: saveContext(current, app, env), app, env, config: current.path, help: ['laravel-cloud-axi', 'laravel-cloud-axi setup hooks'] };
+    const organization = resource((await runtime.client.request('meta/organization')).data).id;
+    return { changed: saveContext(current, app, env, organization), app, env, organization, config: current.path, help: ['laravel-cloud-axi', 'laravel-cloud-axi setup hooks'] };
   }
   if (command === 'setup') {
     if (args.length === 1 && args[0] === '--help') return { command: 'laravel-cloud-axi setup hooks [--status|--remove]', description: 'Opt-in project hooks for Claude Code, Codex, and OpenCode. Codex also enables hooks in the user config.' };

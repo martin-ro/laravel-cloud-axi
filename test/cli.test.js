@@ -19,7 +19,7 @@ async function run(argv, responses = [], options = {}) {
   let text = '';
   const previousExit = process.exitCode;
   process.exitCode = 0;
-  const client = createClient({ token: 'test-token', fetch: async (url, request) => {
+  const client = createClient({ token: 'test-token', cwd, homeDir: options.homeDir ?? cwd, ...options.clientOptions, fetch: async (url, request) => {
     calls.push({ url, ...request });
     const response = responses.shift();
     assert.notEqual(response, undefined, `Unexpected request: ${request.method} ${url}`);
@@ -159,18 +159,238 @@ test('HTTP errors are structured, redact the token, and never retry', async () =
 });
 
 test('auth redacts successful responses and environment billing includes its selected cost', async () => {
-  const previous = process.env.LARAVEL_CLOUD_TOKEN;
-  process.env.LARAVEL_CLOUD_TOKEN = 'test-token';
-  try {
-    const auth = await run(['auth'], [{ data: entity('org-1', { name: 'test-token' }) }]);
-    assert.equal(auth.data.organization.name, '[REDACTED]');
-  } finally {
-    if (previous === undefined) delete process.env.LARAVEL_CLOUD_TOKEN;
-    else process.env.LARAVEL_CLOUD_TOKEN = previous;
-  }
+  const auth = await run(['auth'], [{ data: entity('org-1', { name: 'test-token' }) }]);
+  assert.equal(auth.data.organization.name, '[REDACTED]');
+  assert.equal(auth.data.source, 'environment');
   const usage = await run(['usage', '--env', 'env-1'], [{ data: { summary: { current_spend_cents: 400 }, environment_usage: { total_cost_cents: 123, items: [] } }, meta: { currency: 'USD' } }]);
   assert.equal(usage.data.usage.environment_usage.total_cost_cents, 123);
   assert.equal(usage.calls[0].url.searchParams.get('environment'), 'env-1');
+});
+
+test('official Cloud login wins over fallbacks, stays read-only and redacted, and never switches after rejection', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-auth-'));
+  const path = join(root, '.config/cloud/config.json');
+  const options = { cwd: root, clientOptions: { token: 'environment-credential' } };
+  try {
+    mkdirSync(join(root, '.git'));
+    mkdirSync(join(root, '.env'));
+    mkdirSync(join(root, '.config/cloud'), { recursive: true });
+    const content = JSON.stringify({ api_tokens: ['saved-credential', 'saved-credential'], unrelated: true });
+    writeFileSync(path, content, { mode: 0o600 });
+    const modified = statSync(path).mtimeMs;
+    for (let i = 0; i < 2; i++) {
+      const auth = await run(['auth'], [{ data: entity('org-1', { name: 'saved-credential' }) }], options);
+      assert.equal(auth.code, 0, auth.text);
+      assert.equal(auth.calls.length, 1);
+      assert.equal(auth.calls[0].headers.Authorization, 'Bearer saved-credential');
+      assert.equal(auth.data.organization.name, '[REDACTED]');
+      assert.equal(auth.data.source, 'cloud-cli');
+    }
+    const full = await run(['environment', 'view', 'env-1', '--full'], [{ data: entity('env-1', { build_command: `${'x'.repeat(995)}saved-credential` }) }], options);
+    assert.ok(!full.text.includes('saved-credential'));
+    const denied = await run(['auth'], [Response.json({ message: `${'x'.repeat(995)}saved-credential`, errors: { detail: ['saved-credential'] } }, { status: 401 })], options);
+    assert.equal(denied.data.code, 'AUTH_REQUIRED');
+    assert.equal(denied.calls.length, 1);
+    assert.ok(!denied.text.includes('saved-'), 'Redact before truncation.');
+    assert.match(denied.text, /cloud auth/);
+    const invalidFallback = await run(['auth'], [{ data: entity('org-1') }], { ...options, clientOptions: { token: 'bad\ncredential' } });
+    assert.equal(invalidFallback.code, 0, 'An unused fallback must not prevent saved login.');
+    assert.equal(readFileSync(path, 'utf8'), content);
+    assert.equal(statSync(path).mtimeMs, modified);
+    assert.equal(existsSync(join(root, '.cloud')), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('multiple official logins use the project organization without guessing or changing credentials', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-organizations-'));
+  const cwd = join(root, 'project');
+  const path = join(root, '.config/cloud/config.json');
+  const project = join(cwd, '.cloud/config.json');
+  const options = { cwd: join(cwd, 'sub'), homeDir: root, clientOptions: { token: 'fallback-credential' } };
+  const organizations = () => [Response.json({ message: 'Expired' }, { status: 401 }), { data: entity('org-1') }, { data: entity('org-2') }];
+  try {
+    mkdirSync(join(root, '.config/cloud'), { recursive: true });
+    mkdirSync(join(cwd, '.cloud'), { recursive: true });
+    mkdirSync(join(cwd, '.git'));
+    mkdirSync(options.cwd);
+    const content = JSON.stringify({ api_tokens: ['expired-credential', 'first-credential', 'second-credential'] });
+    writeFileSync(path, content, { mode: 0o600 });
+    writeFileSync(project, '{"organization_id":"org-2"}');
+    const apps = await run(['app', 'list', '--all'], [...organizations(),
+      page([entity('app-1', { name: 'expired-credential first-credential second-credential' })], 2, '?page=2'),
+      page([entity('app-2')], 2),
+    ], options);
+    assert.equal(apps.code, 0, apps.text);
+    assert.equal(apps.calls.length, 5, 'Resolve the login once, not once per page.');
+    assert.ok(apps.calls.slice(3).every(call => call.headers.Authorization === 'Bearer second-credential'));
+    assert.ok(!apps.text.includes('-credential'));
+    assert.equal(readFileSync(path, 'utf8'), content);
+    writeFileSync(project, '{}');
+    const ambiguous = await run(['auth'], [], options);
+    assert.equal(ambiguous.data.code, 'AUTH_AMBIGUOUS');
+    assert.equal(ambiguous.calls.length, 0);
+    assert.match(ambiguous.text, /cloud repo:config/);
+    writeFileSync(project, '{"organization_id":"org-missing"}');
+    const unmatched = await run(['deploy', '--env', 'env-1', '--confirm'], organizations(), options);
+    assert.equal(unmatched.data.code, 'AUTH_ORGANIZATION');
+    assert.equal(unmatched.calls.length, 3);
+    assert.ok(unmatched.calls.every(call => call.method === 'GET'));
+    writeFileSync(path, '{"api_tokens":["first-credential"]}');
+    const singleMismatch = await run(['deploy', '--env', 'env-1', '--confirm'], [{ data: entity('org-1') }], options);
+    assert.equal(singleMismatch.data.code, 'AUTH_ORGANIZATION');
+    assert.equal(singleMismatch.calls.length, 1);
+    assert.equal(singleMismatch.calls[0].method, 'GET');
+    writeFileSync(project, '{"organization_id":[]}');
+    const invalid = await run(['auth'], [], options);
+    assert.equal(invalid.data.code, 'CONFIG_ERROR');
+    assert.equal(invalid.calls.length, 0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('missing login permits fallbacks, broken login files fail safely, and local commands do not read credentials', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-auth-errors-'));
+  const path = join(root, '.config/cloud/config.json');
+  const options = { cwd: root, clientOptions: { token: '' } };
+  try {
+    mkdirSync(join(root, '.git'));
+    const missing = await run(['auth'], [], options);
+    assert.equal(missing.data.code, 'AUTH_REQUIRED');
+    assert.match(missing.text, /cloud auth/);
+    const environment = await run(['auth'], [{ data: entity('org-1') }], { ...options, clientOptions: { token: 'environment-credential' } });
+    assert.equal(environment.data.source, 'environment');
+    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=dotenv-credential\n');
+    const dotenv = await run(['auth'], [{ data: entity('org-2') }], options);
+    assert.equal(dotenv.data.source, 'dotenv');
+    const invalid = await run(['auth'], [], { ...options, clientOptions: { token: 'bad\ncredential' } });
+    assert.equal(invalid.data.code, 'AUTH_INVALID');
+    assert.equal(invalid.calls.length, 0);
+    mkdirSync(join(root, '.config/cloud'), { recursive: true });
+    for (const content of ['{"api_tokens":["do-not-echo",', 'null', '[]', '{"api_tokens":"bad"}', '{"api_tokens":[123]}', '{"api_tokens":["bad credential"]}']) {
+      writeFileSync(path, content);
+      const broken = await run(['auth'], [], options);
+      assert.equal(broken.data.code, 'AUTH_CONFIG_ERROR');
+      assert.equal(broken.calls.length, 0);
+      assert.ok(!broken.text.includes('do-not-echo'));
+      assert.equal(readFileSync(path, 'utf8'), content);
+    }
+    rmSync(path);
+    mkdirSync(path);
+    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_CONFIG_ERROR');
+    for (const argv of [['--help'], ['auth', '--help'], ['auth', 'status', '--help'], ['deploy', '--env', 'env-1', '--dry-run']]) {
+      const local = await run(argv, [], options);
+      assert.equal(local.code, 0, local.text);
+      assert.equal(local.calls.length, 0);
+    }
+    for (const action of ['login', 'logout']) {
+      const result = await run(['auth', action], [], options);
+      assert.equal(result.code, 2);
+      assert.equal(result.calls.length, 0);
+      assert.match(result.text, /cloud auth/);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('.env fallback handles quotes and comments, stays read-only, and redacts the token', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-dotenv-'));
+  const path = join(root, '.env');
+  const marker = join(root, 'must-not-exist');
+  const options = { cwd: join(root, 'sub'), homeDir: root, clientOptions: { token: '' } };
+  const keys = ['LARAVEL_CLOUD_TOKEN', 'LARAVEL_CLOUD_API_TOKEN', 'CLOUD_AXI_DOTENV_UNUSED'];
+  const previous = keys.map(key => process.env[key]);
+  try {
+    mkdirSync(join(root, '.git'));
+    mkdirSync(options.cwd);
+    for (const assignment of [
+      'LARAVEL_CLOUD_API_TOKEN=dotenv-credential',
+      'LARAVEL_CLOUD_API_TOKEN = "dotenv-credential" # comment',
+      "export LARAVEL_CLOUD_API_TOKEN='dotenv-credential'",
+    ]) {
+      const content = `# local credentials\r\nLARAVEL_CLOUD_TOKEN=ignored\r\n${assignment}\r\nCLOUD_AXI_DOTENV_UNUSED=$(touch ${marker})\r\n`;
+      writeFileSync(path, content, { mode: 0o600 });
+      const modified = statSync(path).mtimeMs;
+      const auth = await run(['auth'], [{ data: entity('org-1', { name: 'dotenv-credential' }) }], options);
+      assert.equal(auth.code, 0, auth.text);
+      assert.equal(auth.calls.length, 1);
+      assert.equal(auth.calls[0].headers.Authorization, 'Bearer dotenv-credential');
+      assert.equal(auth.data.organization.name, '[REDACTED]');
+      assert.equal(readFileSync(path, 'utf8'), content);
+      assert.equal(statSync(path).mtimeMs, modified);
+      assert.ok(keys.every((key, index) => process.env[key] === previous[index]), '.env must not change process.env.');
+      assert.equal(existsSync(marker), false);
+    }
+    const full = await run(['environment', 'view', 'env-1', '--full'], [{ data: entity('env-1', { build_command: `${'x'.repeat(995)}dotenv-credential` }) }], options);
+    assert.match(full.data.environment.build_command, /\[REDACTED\]$/);
+    assert.ok(!full.text.includes('dotenv-credential'));
+    const denied = await run(['auth'], [Response.json({ message: `${'x'.repeat(995)}dotenv-credential`, errors: { detail: ['dotenv-credential'] } }, { status: 401 })], options);
+    assert.equal(denied.data.code, 'AUTH_REQUIRED');
+    assert.equal(denied.calls.length, 1);
+    assert.ok(!denied.text.includes('dotenv-'), 'Redact .env credentials before truncation.');
+    const override = await run(['auth'], [{ data: entity('org-2') }], { ...options, clientOptions: { token: 'override-credential' } });
+    assert.equal(override.calls[0].headers.Authorization, 'Bearer override-credential');
+    assert.equal(existsSync(join(root, '.cloud')), false);
+    assert.equal(existsSync(join(root, '.config/cloud')), false);
+  } finally {
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('.env lookup respects project boundaries, validates tokens, and keeps organization guards', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-dotenv-scope-'));
+  const cwd = join(root, 'repo');
+  const path = join(cwd, '.env');
+  const options = { cwd: join(cwd, 'sub'), homeDir: root, clientOptions: { token: '' } };
+  try {
+    mkdirSync(join(cwd, '.git'), { recursive: true });
+    mkdirSync(options.cwd);
+    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=outside-credential\n');
+    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_REQUIRED', 'Do not read .env above the Git root.');
+    for (const [content, code] of [
+      ['LARAVEL_CLOUD_TOKEN=ignored', 'AUTH_REQUIRED'],
+      ['LARAVEL_CLOUD_API_TOKEN=', 'AUTH_REQUIRED'],
+      ['LARAVEL_CLOUD_API_TOKEN="bad credential"', 'AUTH_INVALID'],
+      ['LARAVEL_CLOUD_API_TOKEN="bad\ncredential"', 'AUTH_INVALID'],
+    ]) {
+      writeFileSync(path, content);
+      const result = await run(['auth'], [], options);
+      assert.equal(result.data.code, code);
+      assert.equal(result.calls.length, 0);
+      assert.ok(!result.text.includes('bad credential'));
+    }
+    rmSync(path);
+    mkdirSync(path);
+    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_CONFIG_ERROR');
+    for (const argv of [['--help'], ['auth', '--help'], ['deploy', '--env', 'env-1', '--dry-run']]) {
+      const local = await run(argv, [], options);
+      assert.equal(local.code, 0, local.text);
+      assert.equal(local.calls.length, 0);
+    }
+    rmSync(path, { recursive: true });
+    writeFileSync(path, 'LARAVEL_CLOUD_API_TOKEN=dotenv-credential\n');
+    mkdirSync(join(root, '.config/cloud'), { recursive: true });
+    writeFileSync(join(root, '.config/cloud/config.json'), '{"api_tokens":[]}');
+    mkdirSync(join(cwd, '.cloud'));
+    writeFileSync(join(cwd, '.cloud/config.json'), '{"organization_id":"org-2"}');
+    const mismatch = await run(['deploy', '--env', 'env-1', '--confirm'], [{ data: entity('org-1') }], options);
+    assert.equal(mismatch.data.code, 'AUTH_ORGANIZATION');
+    assert.equal(mismatch.calls.length, 1);
+    assert.equal(mismatch.calls[0].method, 'GET');
+    const matched = await run(['app', 'list'], [{ data: entity('org-2') }, page([])], options);
+    assert.equal(matched.code, 0, matched.text);
+    assert.ok(matched.calls.every(call => call.headers.Authorization === 'Bearer dotenv-credential'));
+
+    writeFileSync(join(options.cwd, '.git'), 'gitdir: ../.git/worktrees/child\n');
+    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_REQUIRED', 'A nested Git root blocks the parent project.');
+    mkdirSync(join(options.cwd, '.cloud'));
+    writeFileSync(join(options.cwd, '.cloud/config.json'), '{}');
+    writeFileSync(join(options.cwd, '.env'), 'LARAVEL_CLOUD_API_TOKEN=child-credential\n');
+    const nested = await run(['auth'], [{ data: entity('org-3') }], options);
+    assert.equal(nested.code, 0, nested.text);
+    assert.equal(nested.calls[0].headers.Authorization, 'Bearer child-credential');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('deploy and command send exact targets and return operation state in the same call', async () => {
@@ -251,20 +471,22 @@ test('context stays at the repo boundary, uses the cwd outside Git and preserves
     mkdirSync(plain);
     assert.equal(context(plain).directory, plain);
     mkdirSync(join(cwd, '.cloud'));
-    writeFileSync(join(cwd, '.cloud/config.json'), JSON.stringify({ unrelated: true }));
-    const responses = [{ data: entity('app-1') }, { data: entity('env-1', { status: 'running', name: 'Production' }, { application: { data: { id: 'app-1' } } }) }];
+    writeFileSync(join(cwd, '.cloud/config.json'), JSON.stringify({ unrelated: true, organization_id: 'org-stale' }));
+    const responses = [{ data: entity('app-1') }, { data: entity('env-1', { status: 'running', name: 'Production' }, { application: { data: { id: 'app-1' } } }) }, { data: entity('org-1') }];
     const linked = await run(['link', '--app', 'app-1', '--env', 'env-1'], [...responses], { cwd });
     assert.equal(linked.code, 0);
     assert.equal(linked.data.changed, true);
     const config = JSON.parse(readFileSync(join(cwd, '.cloud/config.json'), 'utf8'));
     assert.equal(config.unrelated, true);
     assert.equal(config.environment_id, 'env-1');
+    assert.equal(config.organization_id, 'org-1', 'Link must replace a stale organization when an override selects another account.');
+    assert.equal(linked.data.organization, 'org-1');
     assert.equal(statSync(join(cwd, '.cloud/config.json')).mode & 0o777, 0o600);
     const again = await run(['link', '--app', 'app-1', '--env', 'env-1'], [...responses], { cwd });
     assert.equal(again.data.changed, false);
-    const home = await run([], [responses[1]], { cwd: join(cwd, 'sub') });
+    const home = await run([], [responses[2], responses[1]], { cwd: join(cwd, 'sub') });
     assert.equal(home.data.environment.name, 'Production');
-    assert.equal(home.calls[0].url.pathname, '/api/environments/env-1');
+    assert.equal(home.calls[1].url.pathname, '/api/environments/env-1');
     const noDefaultMutation = await run(['deploy', '--confirm'], [], { cwd });
     assert.equal(noDefaultMutation.code, 2);
     const wrong = await run(['link', '--app', 'app-2', '--env', 'env-1'], [...responses], { cwd });
@@ -310,9 +532,10 @@ test('opt-in hooks install, repeat, and remove without changing unrelated settin
   }
 });
 
-test('executable version probes bypass the command graph; errors use stdout, not stderr', () => {
+test('executable reuses official Cloud login across processes without keyring services', () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-axi-bin-'));
   try {
+    mkdirSync(join(root, '.git'));
     mkdirSync(join(root, 'bin'));
     copyFileSync(bin, join(root, 'bin/laravel-cloud-axi.js'));
     writeFileSync(join(root, 'package.json'), JSON.stringify({ type: 'module', version: '9.8.7' }));
@@ -322,9 +545,43 @@ test('executable version probes bypass the command graph; errors use stdout, not
       assert.equal(child.stdout, '9.8.7\n');
       assert.equal(child.stderr, '');
     }
-    const child = spawnSync(process.execPath, [bin, 'auth'], { cwd: root, env: { ...process.env, LARAVEL_CLOUD_TOKEN: '' }, encoding: 'utf8' });
-    assert.equal(child.status, 1);
-    assert.equal(child.stderr, '');
-    assert.equal(decode(child.stdout).code, 'AUTH_REQUIRED');
+    mkdirSync(join(root, '.config/cloud'), { recursive: true });
+    const login = join(root, '.config/cloud/config.json');
+    const content = JSON.stringify({ api_tokens: ['saved-credential'] });
+    writeFileSync(login, content, { mode: 0o600 });
+    const preload = join(root, 'offline.mjs');
+    writeFileSync(preload, `globalThis.fetch = async (url, request) => {
+        if (url.href !== 'https://cloud.laravel.com/api/meta/organization' || request.method !== 'GET'
+          || request.headers.Authorization !== 'Bearer ' + process.env.CLOUD_AXI_TEST_EXPECTED) throw new Error('Unexpected authentication request');
+        return Response.json({ data: { id: 'org-1', attributes: { name: process.env.CLOUD_AXI_TEST_EXPECTED } } });
+      };`);
+    function invoke(args, environment = {}) {
+      const child = spawnSync(process.execPath, ['--import', preload, bin, ...args], {
+        cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, DBUS_SESSION_BUS_ADDRESS: `unix:path=${root}/no-bus`, LARAVEL_CLOUD_TOKEN: 'legacy-credential', LARAVEL_CLOUD_API_TOKEN: '', ...environment },
+        encoding: 'utf8', timeout: 5000,
+      });
+      assert.equal(child.stderr, '');
+      assert.ok(!child.stdout.includes('-credential'));
+      return { status: child.status, data: decode(child.stdout) };
+    }
+    for (const HOME of [root, '']) {
+      const saved = invoke(['auth'], { HOME, CLOUD_AXI_TEST_EXPECTED: 'saved-credential', LARAVEL_CLOUD_API_TOKEN: 'environment-credential' });
+      assert.equal(saved.status, 0);
+      assert.equal(saved.data.source, 'cloud-cli');
+      assert.equal(saved.data.organization.name, '[REDACTED]');
+      assert.equal(readFileSync(login, 'utf8'), content);
+    }
+    rmSync(login);
+    const missing = invoke(['auth']);
+    assert.equal(missing.status, 1);
+    assert.equal(missing.data.code, 'AUTH_REQUIRED', 'LARAVEL_CLOUD_TOKEN is not an authentication source.');
+    const environment = invoke(['auth'], { CLOUD_AXI_TEST_EXPECTED: 'environment-credential', LARAVEL_CLOUD_API_TOKEN: 'environment-credential' });
+    assert.equal(environment.status, 0);
+    assert.equal(environment.data.source, 'environment');
+    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=dotenv-credential\n');
+    const dotenv = invoke(['auth'], { CLOUD_AXI_TEST_EXPECTED: 'dotenv-credential' });
+    assert.equal(dotenv.status, 0);
+    assert.equal(dotenv.data.source, 'dotenv');
+    assert.equal(existsSync(login), false, 'Fallback credentials are not copied into a login file.');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

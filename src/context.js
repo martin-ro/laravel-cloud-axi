@@ -25,9 +25,9 @@ export function context(cwd = process.cwd()) {
   }
 }
 
-export function saveContext(current, app, env) {
-  const data = { ...current.data, application_id: app, environment_id: env };
-  if (current.data.application_id === app && current.data.environment_id === env) return false;
+export function saveContext(current, app, env, organization) {
+  const data = { ...current.data, application_id: app, environment_id: env, organization_id: organization };
+  if (current.data.application_id === app && current.data.environment_id === env && current.data.organization_id === organization) return false;
   mkdirSync(dirname(current.path), { recursive: true });
   const temporary = `${current.path}.${randomUUID()}.tmp`;
   try {

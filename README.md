@@ -2,7 +2,7 @@
 
 An [AXI](https://axi.md/) for Laravel Cloud: compact TOON output, live project state, and guarded operations for coding agents.
 
-Uses the [Laravel Cloud API](https://laravel.com/cloud/docs/api/introduction) directly. It does not need PHP or the `cloud` executable. The [AXI SDK](https://github.com/kunchenguid/axi/tree/main/packages/axi-sdk-js) supplies the command runtime and optional session hooks.
+Uses the [Laravel Cloud API](https://laravel.com/cloud/docs/api/introduction) directly. The official Cloud CLI owns browser login and credential storage, just as `gh` owns authentication for `gh-axi`. API calls reuse that saved login and do not need PHP or the `cloud` executable. The [AXI SDK](https://github.com/kunchenguid/axi/tree/main/packages/axi-sdk-js) supplies the command runtime and optional session hooks.
 
 ## Install from this checkout
 
@@ -20,15 +20,31 @@ The examples below assume the PATH install. Otherwise use `node /path/to/laravel
 
 ## Authentication
 
-Create a scoped API token in your Laravel Cloud organization settings. Supply it as `LARAVEL_CLOUD_TOKEN`, preferably through a secret manager.
+Log in once with the [official Laravel Cloud CLI](https://github.com/laravel/cloud-cli):
 
 ```sh
-export LARAVEL_CLOUD_TOKEN='<your-scoped-token>'
+cloud auth
 laravel-cloud-axi auth
 laravel-cloud-axi
 ```
 
-The token selects the organization. Use read-only permissions unless an operation needs write access. The CLI does not save tokens, read the official CLI's saved OAuth tokens, or open a browser. Avoid putting real tokens in shell history.
+Run `cloud auth` once for the official browser login. Later terminals and agents reuse its saved credentials. `laravel-cloud-axi auth` (or `auth status`) only checks access and reports the organization and source. There is no separate login, token prompt, logout, or keyring implementation in this CLI. Secret Service is not required.
+
+Credential order:
+
+1. The official Cloud CLI login: `api_tokens` in `~/.config/cloud/config.json`.
+2. If no tokens are saved, `LARAVEL_CLOUD_API_TOKEN` in the process environment.
+3. Otherwise, `LARAVEL_CLOUD_API_TOKEN` in the project's `.env`.
+
+The old `LARAVEL_CLOUD_TOKEN` variable is not used by this CLI. Invalid credentials, unreadable login files, and ambiguous saved logins fail rather than switching to another source. API-token fallbacks do not replace a saved login.
+
+With multiple saved tokens, run `cloud repo:config` once in the project to select an organization. Its `.cloud/config.json` `organization_id` selects the matching token. Expired tokens are skipped during this read-only lookup, not removed from the login file. A missing or unmatched selection fails before the requested operation. A single token is also checked against a saved project organization. `link` can update that organization after validating the requested application and environment.
+
+The official CLI currently stores tokens in a **plaintext file**. It owns that storage decision; this CLI only reads the file and never copies or rewrites its credentials. Run `cloud auth` again if the login expires. Home resolution follows the official CLI: `HOME`, then `USERPROFILE`, then the system home directory.
+
+For `.env`, use the directory containing `.cloud/config.json`, or the Git root when unlinked, or the current directory outside Git. Lookup does not cross a Git root. Quotes and comments work; variables and shell commands are not expanded or executed. Only the named token is used, without changing the process environment or writing the file.
+
+For CI, supply `LARAVEL_CLOUD_API_TOKEN` through a secret manager. This needs neither PHP nor the official CLI. Use read-only permissions unless an operation needs write access. Keep `.env` out of Git. Never put real tokens in shell history or commits.
 
 ## Link a project
 
@@ -39,7 +55,7 @@ laravel-cloud-axi link --app <application-id> --env <environment-id>
 laravel-cloud-axi
 ```
 
-`link` verifies that the environment belongs to the application. It merges IDs into `.cloud/config.json`, the same project file used by the official Cloud CLI. Other keys are preserved. Writes are atomic and use mode `0600`. Repeating the same link is a no-op.
+`link` verifies that the environment belongs to the application. It saves the application, environment, and authenticated organization IDs in `.cloud/config.json`, the same project file used by the official Cloud CLI. Other keys are preserved. Writes are atomic and use mode `0600`. Repeating the same link is a no-op.
 
 Read commands find the nearest `.cloud/config.json`, without crossing a Git root. Outside Git, a new link is written in the current directory. Explicit read flags override the linked IDs. Billing is organization-wide unless `--env` is given.
 
@@ -70,7 +86,7 @@ Every command supports `--help`. Flags go after the command. Resource names are 
 | `cache list`, `cache view <id>` | Caches |
 | `bucket list`, `bucket view <id>` | Object storage buckets |
 | `usage --period 0 --env <id>` | Billing totals and environment usage in cents |
-| `auth` | Check the token's organization |
+| `auth`, `auth status` | Check credential source and organization; login with `cloud auth` |
 | `setup hooks [--status\|--remove]` | Optional project session hooks |
 
 A resource noun without an action runs its list command. For example, `cache` means `cache list`.
@@ -134,7 +150,7 @@ Setup uses the SDK to install project-scoped integrations for:
 
 Codex also needs the shared `hooks = true` feature in **`~/.codex/config.toml`**. Setup enables that user-level feature. Removing hooks leaves the shared feature enabled and preserves unrelated configuration.
 
-Normal commands never install hooks. Setup repairs the executable path after relocation. Repeating setup with the same path does not rewrite files. Hooks use the linked project and need the token in the agent's environment. No session transcripts are collected.
+Normal commands never install hooks. Setup repairs the executable path after relocation. Repeating setup with the same path does not rewrite files. Hooks use the linked project and the same credential order: official Cloud CLI login, then `LARAVEL_CLOUD_API_TOKEN` from the environment or `.env`. No session transcripts are collected.
 
 Use a persistent installation for hooks, not an `npx` cache. The current SDK does not quote fallback executable paths, so setup rejects paths with spaces or shell metacharacters. Hook integration is tested on Linux; Windows is not validated.
 
@@ -151,7 +167,7 @@ npm run check
 npm pack --dry-run
 ```
 
-Tests use Node's built-in test runner and simulated Cloud responses. They cover input validation, API errors, pagination, redaction, operation status, context persistence, hooks, and executable behavior. They do not need a Cloud account and never call the live API.
+Tests use Node's built-in test runner and simulated Cloud responses. They cover input validation, saved login selection, `.env` fallback, credential overrides, API errors, pagination, redaction, operation status, context persistence, hooks, and executable behavior. They do not need a Cloud account and never call the live API.
 
 The skill is generated from the CLI's shared guidance. `npm run check` fails when it is stale. GitHub Actions runs these checks on Node 22 and 24.
 

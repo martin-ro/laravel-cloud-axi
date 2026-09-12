@@ -1,10 +1,11 @@
 import { runAxiCli, AxiError } from 'axi-sdk-js';
 import { encode as renderOutput } from '@toon-format/toon';
-import { createClient, present } from './cloud.js';
+import { AUTH_HELP, createClient, present } from './cloud.js';
 import { COMMAND_NAMES, DESCRIPTION, GUIDANCE, execute } from './commands.js';
 
 export async function main(argv, options = {}) {
-  const runtime = { client: createClient(), cwd: process.cwd(), ...options };
+  const runtime = { cwd: process.cwd(), ...options };
+  runtime.client ??= createClient({ cwd: runtime.cwd, homeDir: runtime.homeDir });
   await runAxiCli({
     argv,
     version: options.version ?? '0.1.0',
@@ -21,12 +22,12 @@ export async function main(argv, options = {}) {
         resources: 'instance | database (clusters) | cache | bucket | domain: list | view <id>',
         logs: '--env <id> [--since 1h] [--query "..."]',
         usage: '[--period 0..3] [--env <id>]',
-        auth: 'Check token access and organization',
+        auth: '[status]: check access and source; use cloud auth for login',
         link: '--app <id> --env <id>: save read defaults for this project',
         setup: 'hooks [--status|--remove]: opt-in session context for supported agents',
         home: 'Show live project state, also the default with no arguments',
       },
-      rules: ['Set LARAVEL_CLOUD_TOKEN. IDs are exact, never guessed from names.', 'Read commands may use linked defaults. Mutations require explicit IDs and --confirm.', 'No automatic mutation retries. --full never reveals structured secrets.', 'Each command supports --help. Lists support --page and --all.'],
+      rules: [AUTH_HELP, 'IDs are exact, never guessed from names.', 'Read commands may use linked defaults. Mutations require explicit IDs and --confirm.', 'No automatic mutation retries. --full never reveals structured secrets.', 'Each command supports --help. Lists support --page and --all.'],
       examples: GUIDANCE.slice(0, 3),
     })}\n`,
     home: () => execute('home', [], runtime),

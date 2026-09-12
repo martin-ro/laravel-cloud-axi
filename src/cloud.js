@@ -1,14 +1,50 @@
 import { AxiError } from 'axi-sdk-js';
-import { stripVTControlCharacters } from 'node:util';
+import { parseEnv, stripVTControlCharacters } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
+import { join } from 'node:path';
+import { context } from './context.js';
 
 export const API_URL = 'https://cloud.laravel.com/api/';
 const MAX_BYTES = 5 * 1024 * 1024;
-const AUTH_HELP = 'Set LARAVEL_CLOUD_TOKEN to a scoped API token, then run `laravel-cloud-axi auth`.';
+export const AUTH_HELP = 'Run `cloud auth` once with the official Laravel Cloud CLI. Fallback: LARAVEL_CLOUD_API_TOKEN in the environment, then the project .env.';
+const ORGANIZATION_HELP = 'Run `cloud repo:config` in this project to select an organization. Use `cloud auth` to renew the official CLI login.';
+const validToken = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[^\x21-\x7e]/.test(value);
 
-export function clean(value, token = process.env.LARAVEL_CLOUD_TOKEN) {
+function savedTokens(homeDir = process.env.HOME || process.env.USERPROFILE || userInfo().homedir) {
+  let text;
+  try { text = readFileSync(join(homeDir, '.config', 'cloud', 'config.json'), 'utf8'); } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw new AxiError('Cannot read the official Cloud CLI login file.', 'AUTH_CONFIG_ERROR', [AUTH_HELP]);
+  }
+  let config;
+  try { config = JSON.parse(text); } catch {
+    throw new AxiError('The official Cloud CLI login file is not valid JSON.', 'AUTH_CONFIG_ERROR', [AUTH_HELP]);
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)
+    || !Array.isArray(config.api_tokens ?? []) || (config.api_tokens ?? []).some(value => !validToken(value))) {
+    throw new AxiError('The official Cloud CLI login file has an invalid api_tokens list.', 'AUTH_CONFIG_ERROR', [AUTH_HELP]);
+  }
+  return [...new Set(config.api_tokens ?? [])];
+}
+
+function dotenvToken(directory) {
+  let token;
+  try { token = parseEnv(readFileSync(join(directory, '.env'), 'utf8')).LARAVEL_CLOUD_API_TOKEN; } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw new AxiError('Cannot read or parse the project .env file.', 'AUTH_CONFIG_ERROR', [AUTH_HELP]);
+  }
+  if (token && !validToken(token)) throw new AxiError('Invalid LARAVEL_CLOUD_API_TOKEN in the project .env file.', 'AUTH_INVALID', [AUTH_HELP]);
+  return token;
+}
+
+export function clean(value, token = process.env.LARAVEL_CLOUD_API_TOKEN) {
   if (typeof value === 'string') {
-    const text = stripVTControlCharacters(value);
-    return token ? text.split(token).join('[REDACTED]') : text;
+    let text = stripVTControlCharacters(value);
+    for (const secret of [token].flat().filter(Boolean).sort((a, b) => b.length - a.length)) {
+      text = text.split(secret).join('[REDACTED]');
+    }
+    return text;
   }
   if (Array.isArray(value)) return value.map(item => clean(item, token));
   if (value && typeof value === 'object') {
@@ -20,14 +56,57 @@ export function clean(value, token = process.env.LARAVEL_CLOUD_TOKEN) {
   return value;
 }
 
-export function createClient({ token = process.env.LARAVEL_CLOUD_TOKEN, fetch: fetcher = globalThis.fetch } = {}) {
-  async function request(path, { method = 'GET', body, signal } = {}) {
-    if (!token?.trim()) throw new AxiError('No API token configured.', 'AUTH_REQUIRED', [AUTH_HELP]);
-    if (token !== token.trim() || /[\r\n]/.test(token)) throw new AxiError('API token contains whitespace. Check LARAVEL_CLOUD_TOKEN.', 'AUTH_INVALID', [AUTH_HELP]);
+export function createClient({ token = process.env.LARAVEL_CLOUD_API_TOKEN, fetch: fetcher = globalThis.fetch, cwd = process.cwd(), homeDir } = {}) {
+  let authentication;
+  let secrets = [];
+  let source = null;
+
+  function endpoint(path) {
     const url = new URL(path, API_URL);
     if (url.origin !== new URL(API_URL).origin || !url.pathname.startsWith('/api/') || url.username || url.password || url.hash) {
       throw new AxiError('Refused an API URL outside Laravel Cloud.', 'UNSAFE_URL');
     }
+    return url;
+  }
+
+  async function resolveToken(signal, ignoreProjectOrganization) {
+    signal?.throwIfAborted();
+    secrets = savedTokens(homeDir);
+    source = 'cloud-cli';
+    const current = context(cwd);
+    if (!secrets.length) {
+      source = token !== undefined && token !== '' ? 'environment' : 'dotenv';
+      const fallback = source === 'environment' ? token : dotenvToken(current.directory);
+      if (!fallback) throw new AxiError('No official Cloud CLI login or LARAVEL_CLOUD_API_TOKEN fallback found.', 'AUTH_REQUIRED', [AUTH_HELP]);
+      if (!validToken(fallback)) throw new AxiError(`Invalid API token from ${source}.`, 'AUTH_INVALID', [AUTH_HELP]);
+      secrets = [fallback];
+    }
+    const organization = current.data.organization_id;
+    if (secrets.length === 1 && (organization === undefined || ignoreProjectOrganization)) return secrets[0];
+    if (organization === undefined) throw new AxiError('Multiple saved Cloud tokens need a project organization.', 'AUTH_AMBIGUOUS', [ORGANIZATION_HELP]);
+    if (typeof organization !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{1,199}$/.test(organization)) {
+      throw new AxiError('Invalid organization_id in .cloud/config.json.', 'CONFIG_ERROR', [ORGANIZATION_HELP]);
+    }
+    const deadline = AbortSignal.timeout(10_000);
+    const authSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    for (const credential of secrets) {
+      try {
+        const result = await send(endpoint('meta/organization'), credential, { signal: authSignal });
+        if (resource(result.data).id === organization) return credential;
+      } catch (error) {
+        if (error.httpStatus !== 401) throw error;
+      }
+    }
+    throw new AxiError('No valid configured token matches this project organization.', 'AUTH_ORGANIZATION', [ORGANIZATION_HELP]);
+  }
+
+  async function request(path, options = {}) {
+    const url = endpoint(path);
+    const credential = await (authentication ??= resolveToken(options.signal, options.ignoreProjectOrganization));
+    return send(url, credential, options);
+  }
+
+  async function send(url, credential, { method = 'GET', body, signal } = {}) {
     let response;
     let text = '';
     try {
@@ -35,7 +114,7 @@ export function createClient({ token = process.env.LARAVEL_CLOUD_TOKEN, fetch: f
         method,
         redirect: 'error',
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${credential}`,
           Accept: 'application/json',
           ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
         },
@@ -66,18 +145,18 @@ export function createClient({ token = process.env.LARAVEL_CLOUD_TOKEN, fetch: f
     }
     if (!response.ok) {
       const codes = { 401: 'AUTH_REQUIRED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 422: 'VALIDATION_ERROR', 429: 'RATE_LIMITED' };
-      const message = typeof payload?.message === 'string' ? clean(payload.message, token).slice(0, 1000) : `API request failed (HTTP ${response.status}).`;
+      const message = typeof payload?.message === 'string' ? clean(payload.message, secrets).slice(0, 1000) : `API request failed (HTTP ${response.status}).`;
       const hints = response.status === 401 ? [AUTH_HELP]
         : response.status === 403 ? ['Check the API token permissions for this resource.']
           : response.status === 429 ? [/^\d+$/.test(response.headers.get('retry-after') ?? '') ? `Wait ${response.headers.get('retry-after')} seconds before the next request.` : 'Wait for the API rate limit to reset before retrying.']
             : ['Check the resource ID and run `laravel-cloud-axi --help`.'];
-      const error = new AxiError(clean(message, token), codes[response.status] || 'API_ERROR', hints);
+      const error = new AxiError(message, codes[response.status] || 'API_ERROR', hints);
       error.httpStatus = response.status;
-      error.details = clean(payload?.errors, token);
+      error.details = clean(payload?.errors, secrets);
       throw error;
     }
     if (payload === null || typeof payload !== 'object') throw new AxiError('Invalid API response.', 'INVALID_RESPONSE');
-    return payload;
+    return clean(payload, secrets);
   }
 
   async function list(path, { all = false } = {}) {
@@ -108,7 +187,7 @@ export function createClient({ token = process.env.LARAVEL_CLOUD_TOKEN, fetch: f
       has_more: Boolean(next),
     };
   }
-  return { request, list };
+  return { request, list, get authInfo() { return { source }; } };
 }
 
 export function resource(data) {
