@@ -1,0 +1,268 @@
+{
+  "source": "Official cloud v0.5.0 command metadata and app/Dto sources; synthetic DTO values in cli.test.js. v0.6.0 fallback messages checked against app/Concerns/HasAClient.php.",
+  "commands": {
+    "usage": {
+      "arguments": [],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "period",
+        "environment",
+        "detailed",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "application:get": {
+      "arguments": [
+        "application"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "application:list": {
+      "arguments": [],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "bucket:get": {
+      "arguments": [
+        "bucket"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "bucket:list": {
+      "arguments": [],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "type",
+        "status",
+        "visibility",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "cache:get": {
+      "arguments": [
+        "cache"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "cache:list": {
+      "arguments": [],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "command:get": {
+      "arguments": [
+        "commandId"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "copy-output",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "database-cluster:get": {
+      "arguments": [
+        "cluster"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "database-cluster:list": {
+      "arguments": [],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "deployment:get": {
+      "arguments": [
+        "deployment"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "domain:get": {
+      "arguments": [
+        "domain"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "environment:get": {
+      "arguments": [
+        "environment"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    },
+    "instance:get": {
+      "arguments": [
+        "instance"
+      ],
+      "options": [
+        "json",
+        "fields",
+        "show-sensitive",
+        "help",
+        "silent",
+        "quiet",
+        "verbose",
+        "version",
+        "ansi",
+        "no-ansi",
+        "no-interaction",
+        "env"
+      ]
+    }
+  }
+}

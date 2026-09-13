@@ -1,504 +1,413 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, statSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { decode, encode } from '@toon-format/toon';
 import { main } from '../src/cli.js';
-import { createClient, clean, present } from '../src/cloud.js';
+import { createCloud, clean, present } from '../src/cloud.js';
 import { context } from '../src/context.js';
 
 const bin = resolve('bin/laravel-cloud-axi.js');
-const entity = (id, attributes = {}, relationships = {}) => ({ id, type: 'test', attributes, relationships });
-const page = (data, total = data.length, next = null, current = 1) => ({ data, links: { next }, meta: { total, current_page: current } });
+const nativeCommands = JSON.parse(readFileSync(new URL('./fixtures/native-commands.json', import.meta.url), 'utf8')).commands;
+const missingLogin = 'Not authenticated. Run `cloud auth`, set LARAVEL_CLOUD_TOKEN in your environment, or run `cloud auth:token --add --token=<token>` to save one.';
+const noLogin = { stderr: `${JSON.stringify({ error: true, message: missingLogin })}\n`.repeat(2), code: 1 };
+const app = (id = 'app-1') => ({ id, name: 'Store', region: 'us-east-2', repositoryFullName: 'acme/store', organizationId: 'org-1', organization: { id: 'org-1', name: 'Acme' }, environmentIds: ['env-1'], environments: [{ id: 'env-1', name: 'Production', status: 'running', vanityDomain: 'store.test', slug: 'production' }] });
+const environment = (id = 'env-1') => ({ id, name: 'Production', status: 'running', application: { id: 'app-1' }, instances: ['inst-1'], currentDeploymentId: 'depl-1', environmentVariables: [{ key: 'APP_KEY', value: 'private' }] });
 
 async function run(argv, responses = [], options = {}) {
-  const calls = [];
-  const cwd = options.cwd ?? mkdtempSync(join(tmpdir(), 'cloud-axi-'));
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-test-'));
+  const cwd = options.cwd ?? join(root, 'project');
+  if (!options.cwd) mkdirSync(cwd);
+  const binary = join(root, 'native cloud.mjs');
+  copyFileSync(new URL('./fixtures/cloud.txt', import.meta.url), binary);
+  chmodSync(binary, 0o700);
+  writeFileSync(join(root, 'steps.json'), JSON.stringify(responses.map(value => value && ['stdout', 'stderr', 'code', 'delay', 'bytes', 'childMarker'].some(key => Object.hasOwn(value, key)) ? value : { stdout: JSON.stringify(value) })));
+  const env = { PATH: process.env.PATH, HOME: root, USERPROFILE: root, ...options.env };
+  const cloud = createCloud({ cwd, env, binary, ...options.cloudOptions });
   let text = '';
   const previousExit = process.exitCode;
   process.exitCode = 0;
-  const client = createClient({ token: 'test-token', cwd, homeDir: options.homeDir ?? cwd, ...options.clientOptions, fetch: async (url, request) => {
-    calls.push({ url, ...request });
-    const response = responses.shift();
-    assert.notEqual(response, undefined, `Unexpected request: ${request.method} ${url}`);
-    if (response instanceof Error) throw response;
-    return response instanceof Response ? response : Response.json(response);
-  } });
   try {
-    await main(argv, { cwd, client, stdout: { write: value => { text += value; } }, ...options });
+    await main(argv, { ...options, cwd, cloud, stdout: { write: value => { text += value; } } });
+    const calls = existsSync(join(root, 'calls.jsonl')) ? readFileSync(join(root, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+    for (const { argv } of calls) {
+      if (argv[0] === '--version') continue;
+      const signature = nativeCommands[argv[0]];
+      assert.ok(signature, `Unverified native command ${argv[0]}`);
+      assert.ok(argv.slice(1).filter(arg => !arg.startsWith('--')).length <= signature.arguments.length);
+      for (const flag of argv.slice(1).filter(arg => arg.startsWith('--'))) assert.ok(signature.options.includes(flag.slice(2).split('=')[0]), `Unverified native flag ${flag}`);
+    }
     return { code: process.exitCode ?? 0, data: decode(text), text, calls };
   } finally {
     process.exitCode = previousExit;
-    if (!options.cwd) rmSync(cwd, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
-test('content-first home, compact fields, counts, filters, and next-page scope', async () => {
-  const app = entity('app-1', { name: 'App, One', region: 'us-east-2', repository: { full_name: 'acme/app' }, ignored: 'large' });
-  const home = await run([], [page([app], 8, 'https://cloud.laravel.com/api/applications?page=2')]);
+const reads = ['app', 'environment', 'deployment', 'command', 'instance', 'database', 'cache', 'bucket', 'domain'];
+
+test('native argv, cwd, closed stdin and environment isolation', async () => {
+  const result = await run(['app', 'list'], [[app()]], { env: { AI_AGENT: 'agent', CLAUDECODE: '1', CODEX_SANDBOX: '1', OPENCODE: '1', CLOUD_BASE_URL: 'https://untrusted.test', PHP_INI_SCAN_DIR: '/untrusted', NODE_OPTIONS: '--bad', LARAVEL_CLOUD_TOKEN: 'ignored', LARAVEL_CLOUD_API_TOKEN: 'fallback-value' } });
+  assert.equal(result.code, 0, result.text);
+  const call = result.calls[0];
+  assert.deepEqual(call.argv, ['application:list', '--json', '--no-interaction', '--no-ansi']);
+  assert.match(call.cwd, /\/project$/);
+  assert.equal(call.stdin, '');
+  assert.equal(call.tty, false);
+  assert.equal(call.env.CI, '1');
+  assert.equal(call.env.BROWSER, 'false');
+  for (const key of ['AI_AGENT', 'CLAUDECODE', 'CODEX_SANDBOX', 'OPENCODE', 'CLOUD_BASE_URL', 'PHP_INI_SCAN_DIR', 'NODE_OPTIONS', 'LARAVEL_CLOUD_TOKEN', 'LARAVEL_CLOUD_API_TOKEN']) assert.equal(call.env[key], undefined, key);
+  assert.equal(result.calls.length, 1);
+  assert.deepEqual(Object.keys(result.data.app[0]), ['id', 'name', 'region', 'repositoryFullName']);
+});
+
+test('native collections have honest local totals, filters and complete continuation scope', async () => {
+  const apps = Array.from({ length: 103 }, (_, index) => ({ ...app(`app-${index}`), region: index === 102 ? 'eu' : 'us' }));
+  const home = await run([], [apps]);
   assert.equal(home.code, 0);
-  assert.equal(home.data.total, 8);
-  assert.equal(home.data.count, 1);
-  assert.equal(home.data.has_more, true);
   assert.ok(home.data.bin);
   assert.ok(home.data.description);
-  assert.equal(Object.keys(home.data.app[0]).length, 4);
-  assert.equal(home.data.app[0].name, 'App, One');
-  const list = await run(['deployment', 'list', '--env', 'env-1', '--status', 'failed'], [page([], 9, '?page=2')]);
-  assert.equal(list.calls[0].url.searchParams.get('filter[status]'), 'failed');
-  assert.ok(list.data.help.some(value => value.includes('--env') && value.includes('env-1') && value.includes('--status') && value.includes('--page')));
-});
-
-test('unknown input and invalid values fail before any API request', async () => {
-  for (const args of [
-    ['app', 'list', '--stat', 'running'], ['app', 'view', 'app-1', '--all'], ['app', 'list', 'extra'],
-    ['deploy', '--env', 'env-1'], ['deploy', '--confirm'], ['deploy', '--env', '../bad', '--confirm'],
-    ['command', 'run', '--env', 'env-1', '--confirm'], ['app', 'list', '--page', '0'],
-    ['app', 'list', '--page', '2x'], ['app', 'list', '--fields', 'id,,name'], ['app', 'list', '--fields', '__proto__'],
-    ['app', 'list', '--name', ''], ['app', 'list', '--page', '1', '--page', '2'],
-    ['deploy', '--env', 'env-1', '--confirm', '--dry-run'], ['deploy', '--env', 'env-1', '--confirm', '--timeout', '5'],
-    ['logs', '--env', 'env-1', '--cursor', 'next'], ['logs', '--env', 'env-1', '--type', 'unknown'],
-    ['logs', '--env', 'env-1', '--from', 'not-a-time'], ['logs', '--env', 'env-1', '--since', '0h'],
-    ['usage', '--period', '4'], ['nonesuch'], ['constructor'], ['__proto__'], ['toString'], ['setup', '--help', '--unknown'],
-    ['logs', '--env', 'env-1', '--from', '1'], ['logs', '--env', 'env-1', '--from', '2026-01-01'],
-    ['deployment', 'wait', 'deploy-1', '--timeout', '3601'],
-  ]) {
-    const result = await run(args);
-    assert.equal(result.code, 2, args.join(' '));
-    assert.equal(result.calls.length, 0, args.join(' '));
-    assert.ok(result.data.error);
-  }
-});
-
-test('per-command help and dry runs do not need credentials or make requests', async () => {
-  for (const argv of [
-    ['app', 'list', '--help'], ['environment', 'view', '--help'], ['environment', 'stop', '--help'],
-    ['command', 'run', '--help'], ['deployment', 'wait', '--help'], ['deployment', 'logs', '--help'],
-    ['auth', '--help'], ['setup', 'hooks', '--help'], ['link', '--help'], ['usage', '--help'], ['logs', '--help'],
-  ]) {
-    const result = await run(argv);
-    assert.equal(result.code, 0);
-    assert.equal(result.calls.length, 0);
-    assert.ok(result.data.command);
-  }
-  for (const argv of [
-    ['deploy', '--env', 'env-1', '--dry-run'],
-    ['command', 'run', '--env', 'env-1', '--command', 'php artisan about; echo "quoted"', '--dry-run'],
-    ['environment', 'stop', 'env-1', '--dry-run'],
-  ]) {
-    const result = await run(argv);
-    assert.equal(result.code, 0);
-    assert.equal(result.data.dry_run, true);
-    assert.equal(result.calls.length, 0);
-  }
-});
-
-test('pagination follows same-resource links and preserves totals without losing rows', async () => {
-  const result = await run(['app', 'list', '--all'], [
-    page([entity('app-1')], 2, '?page=2'), page([entity('app-2')], 2, null, 2),
-  ]);
-  assert.equal(result.code, 0);
-  assert.equal(result.data.count, 2);
-  assert.equal(result.data.total, 2);
-  assert.equal(result.data.has_more, false);
-  assert.equal(result.calls.length, 2);
-  for (const next of ['https://evil.example/api/applications', 'https://cloud.laravel.com/api/commands', 'https://cloud.laravel.com/api/applications?page=1']) {
-    const bad = await run(['app', 'list', '--all'], [page([], 1, next)]);
-    assert.equal(bad.code, 1);
-    assert.equal(bad.calls.length, 1);
-  }
-});
-
-test('empty lists are definitive and secret fields stay redacted with --full', async () => {
-  const empty = await run(['cache', 'list'], [page([])]);
+  assert.equal(home.data.count, 100);
+  assert.equal(home.data.total, 103);
+  assert.equal(home.data.has_more, true);
+  const filtered = await run(['app', 'list', '--region', 'us', '--limit', '1'], [apps]);
+  assert.equal(filtered.data.total, 102);
+  assert.equal(filtered.data.count, 1);
+  assert.match(filtered.data.help.at(-1), /--region 'us'.*--all/);
+  assert.ok(!filtered.data.help.at(-1).includes('--limit'));
+  const all = await run(['app', 'list', '--all'], [apps]);
+  assert.equal(all.data.count, 103);
+  assert.equal(all.calls.length, 1);
+  const empty = await run(['cache', 'list', '--status', 'stopped'], [[{ id: 'cache-1', status: 'running' }]]);
   assert.equal(empty.code, 0);
-  assert.equal(empty.data.count, 0);
-  assert.match(empty.data.message, /0 cache/);
-  const detail = entity('env-1', { environment_variables: [{ key: 'PASSWORD', value: 'private' }], connection: { password: 'private' }, build_command: 'x'.repeat(2000) });
-  const normal = await run(['environment', 'view', 'env-1'], [{ data: detail }]);
-  assert.match(normal.text, /truncated, 2000 chars/);
-  assert.ok(normal.data.help.some(line => line.includes('--full')));
-  const full = await run(['environment', 'view', 'env-1', '--full'], [{ data: detail }]);
-  assert.equal(full.data.environment.build_command.length, 2000);
-  assert.ok(!full.text.includes('private'));
-  assert.equal(full.data.environment.environment_variables, '[REDACTED]');
-  assert.equal(full.data.help, undefined);
-  assert.deepEqual(decode(encode(present({ text: 'a,\nb:"quoted"', empty: [], value: null }))), { text: 'a,\nb:"quoted"', empty: [], value: null });
-  assert.equal(clean('test-token', 'test-token'), '[REDACTED]');
-  assert.equal(clean({ 'test-token': 'value' }, 'test-token')['[REDACTED]'], '[REDACTED]');
-  assert.deepEqual(clean({ api_key: 'private', APP_KEY: 'private', apiKey: 'private', cookie: 'private' }), {
-    api_key: '[REDACTED]', APP_KEY: '[REDACTED]', apiKey: '[REDACTED]', cookie: '[REDACTED]',
-  });
+  assert.equal(empty.data.total, 0);
+  assert.match(empty.data.message, /0 cache.*requested filters/);
 });
 
-test('HTTP errors are structured, redact the token, and never retry', async () => {
-  for (const status of [401, 403, 404, 422, 429, 500]) {
-    const response = Response.json({ message: 'test-token denied', errors: { name: ['Invalid name'] } }, { status, headers: { 'retry-after': '30' } });
+test('environment list uses the exact application and included native collection', async () => {
+  const result = await run(['environment', 'list', '--app', 'app-1'], [app()]);
+  assert.equal(result.code, 0, result.text);
+  assert.equal(result.data.environment[0].id, 'env-1');
+  assert.deepEqual(result.calls[0].argv.slice(0, 2), ['application:get', 'app-1']);
+  assert.match(result.data.help.at(-1), /--app 'app-1'/);
+  const wrong = await run(['environment', 'list', '--app', 'app-missing'], [app()]);
+  assert.equal(wrong.data.code, 'TARGET_MISMATCH');
+  assert.equal(wrong.data.environment, undefined);
+  const incomplete = await run(['environment', 'list', '--app', 'app-1'], [{ ...app(), environments: [] }]);
+  assert.equal(incomplete.data.code, 'INVALID_RESPONSE');
+  const empty = await run(['environment', 'list', '--app', 'app-1'], [{ ...app(), environments: [], environmentIds: [] }]);
+  assert.equal(empty.data.total, 0);
+  assert.match(empty.data.message, /0 environment/);
+});
+
+test('every detail maps to native get and rejects fallback, missing and malformed targets', async () => {
+  const nativeNames = { app: 'application', database: 'database-cluster' };
+  const discoveryHints = { app: 'app list', environment: 'environment list --app <id>', deployment: '--fields deploymentIds,currentDeploymentId', command: 'Cloud dashboard', instance: '--fields instances', domain: '--fields domainIds', database: 'database list', cache: 'cache list', bucket: 'bucket list' };
+  for (const noun of reads) {
+    const result = await run([noun, 'view', 'exact-1'], [{ id: 'exact-1', buildCommand: 'build' }]);
+    assert.equal(result.code, 0, result.text);
+    assert.equal(result.calls[0].argv[0], `${nativeNames[noun] ?? noun}:get`);
+    const fallback = await run([noun, 'view', 'missing-1'], [{ id: 'other-1', name: 'Wrong target' }]);
+    assert.equal(fallback.data.code, 'TARGET_MISMATCH');
+    assert.ok(fallback.data.help.some(hint => hint.includes(discoveryHints[noun])), `${noun}: ${fallback.text}`);
+    assert.ok(!fallback.text.includes('Wrong target'));
+    assert.equal(fallback.calls.length, 1);
+  }
+  assert.equal((await run(['app', 'view', 'app-1'], [{}])).data.code, 'INVALID_RESPONSE');
+  assert.equal((await run(['app', 'view'])).code, 2);
+});
+
+test('unknown flags and invalid values fail before any dependency, even with help', async () => {
+  for (const argv of [
+    ['app', 'list', '--stat', 'running'], ['app', 'view', 'app-1', '--all'], ['app', 'list', 'extra'],
+    ['app', 'list', '--unknown', '--help'], ['app', 'list', '--limit', '0'], ['app', 'list', '--limit', '2x'],
+    ['app', 'list', '--all', '--limit', '2'], ['app', 'list', '--limit', '1', '--limit', '2'],
+    ['app', 'list', '--fields', 'id,,name'], ['app', 'list', '--fields', '__proto__'], ['app', 'list', '--name', ''],
+    ['deploy', '--env', '../bad', '--confirm'], ['deploy', '--confirm'], ['deploy', '--env', 'env-1'],
+    ['deploy', '--env', 'env-1', '--confirm', '--dry-run'], ['command', 'run', '--env', 'env-1', '--confirm'],
+    ['usage', '--period', '4'], ['setup', '--help', '--unknown'], ['setup', 'hooks', '--status', '--remove'],
+    ['deployment', 'wait', 'depl-1', '--timeout', '3601'], ['home', '--unknown'], ['update', '--force'], ['nonesuch'], ['constructor'], ['__proto__'], ['toString'],
+  ]) {
+    const result = await run(argv);
+    assert.equal(result.code, 2, `${argv.join(' ')}: ${result.text}`);
+    assert.equal(result.calls.length, 0);
+  }
+  const unknown = await run(['app', 'list', '--stat', 'failed']);
+  assert.match(unknown.text, /Valid flags:.*--name.*--help/);
+  const page = await run(['app', 'list', '--page', '2']);
+  assert.equal(page.code, 2);
+  assert.match(page.text, /--page was removed.*--limit/);
+});
+
+test('help and honest blocked dry runs have no subprocess', async () => {
+  const commands = [...reads.flatMap(noun => [[noun, 'list'], [noun, 'view']]), ['deploy'], ['command', 'run'], ['environment', 'start'], ['environment', 'stop'], ['deployment', 'wait'], ['command', 'wait'], ['deployment', 'logs'], ['logs'], ['usage'], ['auth'], ['auth', 'status'], ['link'], ['setup'], ['setup', 'hooks'], ['home'], ['update']];
+  for (const argv of commands) {
+    const result = await run([...argv, '--help']);
+    assert.equal(result.code, 0, result.text);
+    assert.equal(result.calls.length, 0);
+    assert.ok(result.data.flags);
+    assert.ok(result.data.examples.length >= 2);
+  }
+  for (const argv of [['deploy', '--env', 'env-1'], ['command', 'run', '--env', 'env-1', '--command', 'php artisan about; echo "quoted"'], ['environment', 'stop', 'env-1']]) {
+    const dry = await run([...argv, '--dry-run']);
+    assert.equal(dry.code, 0);
+    assert.equal(dry.data.supported, false);
+    assert.equal(dry.data.dry_run, true);
+    assert.equal(dry.calls.length, 0);
+    const confirmed = await run([...argv, '--confirm']);
+    assert.equal(confirmed.code, 1);
+    assert.equal(confirmed.data.code, 'UNSUPPORTED');
+    assert.equal(confirmed.calls.length, 0);
+  }
+});
+
+test('unprovable or absent native workflows fail explicitly without reads or writes', async () => {
+  for (const argv of [...['deployment', 'command', 'instance', 'domain'].map(noun => [noun, 'list', '--env', 'env-1']), ['logs', '--env', 'env-1'], ['deployment', 'logs', 'depl-1'], ['usage', '--env', 'env-1'], ['update']]) {
+    const result = await run(argv);
+    assert.equal(result.code, 1, result.text);
+    assert.equal(result.data.code, 'UNSUPPORTED');
+    assert.equal(result.calls.length, 0);
+  }
+});
+
+test('unsupported-list help gives supported, runnable read examples', async () => {
+  const identifiers = { environment: 'env-1', deployment: 'depl-1', command: 'comm-1', instance: 'inst-1', domain: 'domain-1' };
+  for (const noun of ['deployment', 'command', 'instance', 'domain']) {
+    const help = await run([noun, 'list', '--help']);
+    for (const example of help.data.examples) {
+      const argv = example.split(' ').slice(1);
+      const identifier = identifiers[argv[0]];
+      const args = argv.map(value => value === '<id>' ? identifier : value);
+      const data = argv[0] === 'environment' ? { ...environment(), deploymentIds: ['depl-1'], domainIds: ['domain-1'] } : { id: identifier, status: 'ready' };
+      const result = await run(args, [data]);
+      assert.equal(result.code, 0, `${example}: ${result.text}`);
+      assert.equal(result.calls.length, 1);
+      assert.ok(!example.includes(`${noun} list`));
+    }
+  }
+});
+
+test('structured secrets and configured fallback are redacted before text previews', async () => {
+  const value = { ...environment(), buildCommand: 'x'.repeat(2000), connection: { password: 'private' }, privateKey: 'private', apiKey: 'private' };
+  const short = await run(['environment', 'view', 'env-1'], [value]);
+  assert.match(short.text, /truncated, 2000 chars/);
+  assert.ok(short.data.help.some(line => line.includes('--full')));
+  const full = await run(['environment', 'view', 'env-1', '--full'], [value]);
+  assert.equal(full.data.environment.buildCommand.length, 2000);
+  assert.equal(full.data.help, undefined);
+  assert.ok(!full.text.includes(': private'));
+  assert.equal(full.data.environment.environmentVariables, '[REDACTED]');
+  const picked = await run(['environment', 'view', 'env-1', '--fields', 'environmentVariables,connection.password'], [value]);
+  assert.ok(!picked.text.includes('private'));
+  const token = 'synthetic-credential';
+  assert.equal(clean(`\u001b[31m${token}`, token), '[REDACTED]');
+  const redacted = await run(['app', 'view', 'app-1'], [{ id: 'app-1', name: `${'x'.repeat(995)}${token}` }], { env: { LARAVEL_CLOUD_API_TOKEN: token } });
+  assert.ok(!redacted.text.includes('synthetic'));
+  assert.deepEqual(decode(encode(present({ text: 'a,\nb:"quoted"', empty: [], value: null }))), { text: 'a,\nb:"quoted"', empty: [], value: null });
+});
+
+test('native failures, stderr, malformed JSON and progress JSON lines are never exposed or retried', async () => {
+  for (const response of [
+    { stderr: 'synthetic-secret traceback', code: 1 }, { stdout: '<html>synthetic-secret</html>' },
+    { stdout: '{}\n{"status":"done"}' }, { stdout: 'null' }, { stdout: '{"error":true,"message":"synthetic-secret"}' },
+    { stderr: JSON.stringify({ error: true, message: 'API token rejected 401 synthetic-secret' }), code: 1 },
+    { stdout: '[]', stderr: 'warning synthetic-secret' },
+  ]) {
     const result = await run(['auth'], [response]);
     assert.equal(result.code, 1);
-    assert.equal(result.data.http_status, status);
-    assert.ok(!result.text.includes('test-token'));
+    assert.ok(result.data.code);
+    assert.ok(!result.text.includes('synthetic-secret'));
     assert.equal(result.calls.length, 1);
-    assert.equal(result.calls[0].redirect, 'error');
-    assert.equal(result.calls[0].headers.Authorization, 'Bearer test-token');
   }
-  const boundary = await run(['auth'], [Response.json({ message: `${'x'.repeat(995)}test-token` }, { status: 403 })]);
-  assert.ok(!boundary.text.includes('test-'), 'Redact before truncation so token fragments cannot leak.');
-  const html = await run(['auth'], [new Response('<html>Proxy error</html>')]);
-  assert.equal(html.code, 1);
-  assert.equal(html.data.code, 'INVALID_RESPONSE');
-  assert.ok(!html.text.includes('<html>'));
-  const big = await run(['auth'], [new Response('x'.repeat(5 * 1024 * 1024 + 1))]);
-  assert.equal(big.data.code, 'RESPONSE_TOO_LARGE');
-  const offline = await run(['deploy', '--env', 'env-1', '--confirm'], [new Error('connection reset')]);
-  assert.equal(offline.data.code, 'OUTCOME_UNKNOWN');
-  assert.equal(offline.calls.length, 1);
-  assert.match(offline.text, /before repeating/);
+  const missing = await run(['auth'], [], { cloudOptions: { binary: '/does-not-exist/cloud' } });
+  assert.equal(missing.data.code, 'DEPENDENCY_ERROR');
 });
 
-test('auth redacts successful responses and environment billing includes its selected cost', async () => {
-  const auth = await run(['auth'], [{ data: entity('org-1', { name: 'test-token' }) }]);
-  assert.equal(auth.data.organization.name, '[REDACTED]');
-  assert.equal(auth.data.source, 'environment');
-  const usage = await run(['usage', '--env', 'env-1'], [{ data: { summary: { current_spend_cents: 400 }, environment_usage: { total_cost_cents: 123, items: [] } }, meta: { currency: 'USD' } }]);
-  assert.equal(usage.data.usage.environment_usage.total_cost_cents, 123);
-  assert.equal(usage.calls[0].url.searchParams.get('environment'), 'env-1');
+test('ambiguous native login directs organization selection without retrying or switching sources', async () => {
+  for (const message of [
+    'Multiple API tokens found. Set organization_id in .cloud/config.json or use `cloud auth:token` to manage tokens.',
+    'Multiple API tokens found. Run `cloud repo:config --organization=<id|name|slug>` to set a default for this repository, or use `cloud auth:token` to manage tokens.',
+  ]) {
+    const result = await run(['auth'], [{ stderr: `${JSON.stringify({ error: true, message })}\n`.repeat(2), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'unused-fallback' } });
+    assert.equal(result.code, 1);
+    assert.equal(result.data.code, 'AUTH_AMBIGUOUS');
+    assert.match(result.text, /cloud repo:config/);
+    assert.match(result.text, /organization_id/);
+    assert.ok(!result.text.includes('cloud auth`'));
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].env.LARAVEL_CLOUD_TOKEN, undefined);
+  }
 });
 
-test('official Cloud login wins over fallbacks, stays read-only and redacted, and never switches after rejection', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-auth-'));
-  const path = join(root, '.config/cloud/config.json');
-  const options = { cwd: root, clientOptions: { token: 'environment-credential' } };
+test('hard time and output bounds stop the native process and child process group', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-kill-'));
   try {
-    mkdirSync(join(root, '.git'));
-    mkdirSync(join(root, '.env'));
-    mkdirSync(join(root, '.config/cloud'), { recursive: true });
-    const content = JSON.stringify({ api_tokens: ['saved-credential', 'saved-credential'], unrelated: true });
-    writeFileSync(path, content, { mode: 0o600 });
-    const modified = statSync(path).mtimeMs;
-    for (let i = 0; i < 2; i++) {
-      const auth = await run(['auth'], [{ data: entity('org-1', { name: 'saved-credential' }) }], options);
-      assert.equal(auth.code, 0, auth.text);
-      assert.equal(auth.calls.length, 1);
-      assert.equal(auth.calls[0].headers.Authorization, 'Bearer saved-credential');
-      assert.equal(auth.data.organization.name, '[REDACTED]');
-      assert.equal(auth.data.source, 'cloud-cli');
-    }
-    const full = await run(['environment', 'view', 'env-1', '--full'], [{ data: entity('env-1', { build_command: `${'x'.repeat(995)}saved-credential` }) }], options);
-    assert.ok(!full.text.includes('saved-credential'));
-    const denied = await run(['auth'], [Response.json({ message: `${'x'.repeat(995)}saved-credential`, errors: { detail: ['saved-credential'] } }, { status: 401 })], options);
-    assert.equal(denied.data.code, 'AUTH_REQUIRED');
-    assert.equal(denied.calls.length, 1);
-    assert.ok(!denied.text.includes('saved-'), 'Redact before truncation.');
-    assert.match(denied.text, /cloud auth/);
-    const invalidFallback = await run(['auth'], [{ data: entity('org-1') }], { ...options, clientOptions: { token: 'bad\ncredential' } });
-    assert.equal(invalidFallback.code, 0, 'An unused fallback must not prevent saved login.');
+    const marker = join(root, 'child-survived');
+    const slow = await run(['auth'], [{ delay: 5000, childMarker: marker }], { cloudOptions: { timeout: 200 } });
+    assert.equal(slow.data.code, 'READ_TIMEOUT');
+    assert.equal(slow.calls.length, 1);
+    const large = await run(['auth'], [{ bytes: 50000 }], { cloudOptions: { maxBytes: 1000 } });
+    assert.equal(large.data.code, 'RESPONSE_TOO_LARGE');
+    assert.equal(large.calls.length, 1);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    if (process.platform !== 'win32') assert.equal(existsSync(marker), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('saved native login remains first; only exact no-login permits a v0.6 environment fallback', async () => {
+  const saved = await run(['auth'], [[app()]], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  assert.equal(saved.data.source, 'cloud-cli');
+  assert.equal(saved.calls.length, 1);
+  assert.equal(saved.calls[0].env.LARAVEL_CLOUD_TOKEN, undefined);
+  const result = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  assert.equal(result.code, 0, result.text);
+  assert.equal(result.data.source, 'environment');
+  assert.equal(result.calls[0].env.LARAVEL_CLOUD_TOKEN, undefined);
+  assert.deepEqual(result.calls[1].argv, ['--version']);
+  assert.equal(result.calls[2].env.LARAVEL_CLOUD_TOKEN, 'synthetic-token');
+  assert.deepEqual(result.calls[0].argv, result.calls[2].argv);
+  const old = await run(['auth'], [noLogin, { stdout: 'Cloud v0.5.0' }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  assert.equal(old.data.code, 'FALLBACK_UNSUPPORTED');
+  assert.equal(old.calls.length, 2);
+  const rejected = await run(['auth'], [{ stderr: JSON.stringify({ error: true, message: 'API token rejected 401' }), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  assert.equal(rejected.data.code, 'AUTH_REQUIRED');
+  assert.equal(rejected.calls.length, 1);
+  const mixed = await run(['auth'], [{ ...noLogin, stderr: `${noLogin.stderr}{"error":true,"message":"other failure"}\n` }]);
+  assert.equal(mixed.calls.length, 1);
+  const deniedFallback = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, { stderr: JSON.stringify({ error: true, message: '401 rejected' }), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  assert.equal(deniedFallback.calls.length, 3);
+  assert.equal(deniedFallback.code, 1);
+});
+
+test('project .env fallback uses synthetic fixtures only, stays read-only and never copies tokens', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-dotenv-'));
+  const cwd = join(root, 'project');
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  mkdirSync(join(cwd, 'sub'));
+  const path = join(cwd, '.env');
+  const content = 'export LARAVEL_CLOUD_API_TOKEN="synthetic-dotenv" # comment\nUNUSED=$(touch must-not-exist)\n';
+  writeFileSync(path, content, { mode: 0o600 });
+  const modified = statSync(path).mtimeMs;
+  const previous = process.env.LARAVEL_CLOUD_TOKEN;
+  try {
+    const fallback = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { cwd: join(cwd, 'sub') });
+    assert.equal(fallback.code, 0, fallback.text);
+    assert.equal(fallback.data.source, 'dotenv');
+    assert.equal(fallback.calls[2].env.LARAVEL_CLOUD_TOKEN, 'synthetic-dotenv');
+    assert.equal(fallback.calls[2].cwd, cwd);
     assert.equal(readFileSync(path, 'utf8'), content);
     assert.equal(statSync(path).mtimeMs, modified);
-    assert.equal(existsSync(join(root, '.cloud')), false);
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
-
-test('multiple official logins use the project organization without guessing or changing credentials', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-organizations-'));
-  const cwd = join(root, 'project');
-  const path = join(root, '.config/cloud/config.json');
-  const project = join(cwd, '.cloud/config.json');
-  const options = { cwd: join(cwd, 'sub'), homeDir: root, clientOptions: { token: 'fallback-credential' } };
-  const organizations = () => [Response.json({ message: 'Expired' }, { status: 401 }), { data: entity('org-1') }, { data: entity('org-2') }];
-  try {
-    mkdirSync(join(root, '.config/cloud'), { recursive: true });
-    mkdirSync(join(cwd, '.cloud'), { recursive: true });
-    mkdirSync(join(cwd, '.git'));
-    mkdirSync(options.cwd);
-    const content = JSON.stringify({ api_tokens: ['expired-credential', 'first-credential', 'second-credential'] });
-    writeFileSync(path, content, { mode: 0o600 });
-    writeFileSync(project, '{"organization_id":"org-2"}');
-    const apps = await run(['app', 'list', '--all'], [...organizations(),
-      page([entity('app-1', { name: 'expired-credential first-credential second-credential' })], 2, '?page=2'),
-      page([entity('app-2')], 2),
-    ], options);
-    assert.equal(apps.code, 0, apps.text);
-    assert.equal(apps.calls.length, 5, 'Resolve the login once, not once per page.');
-    assert.ok(apps.calls.slice(3).every(call => call.headers.Authorization === 'Bearer second-credential'));
-    assert.ok(!apps.text.includes('-credential'));
-    assert.equal(readFileSync(path, 'utf8'), content);
-    writeFileSync(project, '{}');
-    const ambiguous = await run(['auth'], [], options);
-    assert.equal(ambiguous.data.code, 'AUTH_AMBIGUOUS');
-    assert.equal(ambiguous.calls.length, 0);
-    assert.match(ambiguous.text, /cloud repo:config/);
-    writeFileSync(project, '{"organization_id":"org-missing"}');
-    const unmatched = await run(['deploy', '--env', 'env-1', '--confirm'], organizations(), options);
-    assert.equal(unmatched.data.code, 'AUTH_ORGANIZATION');
-    assert.equal(unmatched.calls.length, 3);
-    assert.ok(unmatched.calls.every(call => call.method === 'GET'));
-    writeFileSync(path, '{"api_tokens":["first-credential"]}');
-    const singleMismatch = await run(['deploy', '--env', 'env-1', '--confirm'], [{ data: entity('org-1') }], options);
-    assert.equal(singleMismatch.data.code, 'AUTH_ORGANIZATION');
-    assert.equal(singleMismatch.calls.length, 1);
-    assert.equal(singleMismatch.calls[0].method, 'GET');
-    writeFileSync(project, '{"organization_id":[]}');
-    const invalid = await run(['auth'], [], options);
-    assert.equal(invalid.data.code, 'CONFIG_ERROR');
-    assert.equal(invalid.calls.length, 0);
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
-
-test('missing login permits fallbacks, broken login files fail safely, and local commands do not read credentials', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-auth-errors-'));
-  const path = join(root, '.config/cloud/config.json');
-  const options = { cwd: root, clientOptions: { token: '' } };
-  try {
-    mkdirSync(join(root, '.git'));
-    const missing = await run(['auth'], [], options);
-    assert.equal(missing.data.code, 'AUTH_REQUIRED');
-    assert.match(missing.text, /cloud auth/);
-    const environment = await run(['auth'], [{ data: entity('org-1') }], { ...options, clientOptions: { token: 'environment-credential' } });
-    assert.equal(environment.data.source, 'environment');
-    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=dotenv-credential\n');
-    const dotenv = await run(['auth'], [{ data: entity('org-2') }], options);
-    assert.equal(dotenv.data.source, 'dotenv');
-    const invalid = await run(['auth'], [], { ...options, clientOptions: { token: 'bad\ncredential' } });
+    assert.equal(process.env.LARAVEL_CLOUD_TOKEN, previous);
+    assert.equal(existsSync(join(cwd, '.config')), false);
+    assert.equal(existsSync(join(cwd, 'must-not-exist')), false);
+    writeFileSync(path, 'LARAVEL_CLOUD_API_TOKEN="invalid token"');
+    const invalid = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }], { cwd });
     assert.equal(invalid.data.code, 'AUTH_INVALID');
-    assert.equal(invalid.calls.length, 0);
-    mkdirSync(join(root, '.config/cloud'), { recursive: true });
-    for (const content of ['{"api_tokens":["do-not-echo",', 'null', '[]', '{"api_tokens":"bad"}', '{"api_tokens":[123]}', '{"api_tokens":["bad credential"]}']) {
-      writeFileSync(path, content);
-      const broken = await run(['auth'], [], options);
-      assert.equal(broken.data.code, 'AUTH_CONFIG_ERROR');
-      assert.equal(broken.calls.length, 0);
-      assert.ok(!broken.text.includes('do-not-echo'));
-      assert.equal(readFileSync(path, 'utf8'), content);
-    }
+    assert.equal(invalid.calls.length, 1);
     rmSync(path);
+    const absent = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }], { cwd });
+    assert.equal(absent.data.code, 'AUTH_REQUIRED');
     mkdirSync(path);
-    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_CONFIG_ERROR');
-    for (const argv of [['--help'], ['auth', '--help'], ['auth', 'status', '--help'], ['deploy', '--env', 'env-1', '--dry-run']]) {
-      const local = await run(argv, [], options);
-      assert.equal(local.code, 0, local.text);
-      assert.equal(local.calls.length, 0);
-    }
-    for (const action of ['login', 'logout']) {
-      const result = await run(['auth', action], [], options);
-      assert.equal(result.code, 2);
-      assert.equal(result.calls.length, 0);
-      assert.match(result.text, /cloud auth/);
-    }
+    assert.equal((await run(['auth'], [[app()]], { cwd })).code, 0, 'Saved login must not inspect .env.');
+    assert.equal((await run(['auth', '--help'], [], { cwd })).code, 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('.env fallback handles quotes and comments, stays read-only, and redacts the token', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-dotenv-'));
-  const path = join(root, '.env');
-  const marker = join(root, 'must-not-exist');
-  const options = { cwd: join(root, 'sub'), homeDir: root, clientOptions: { token: '' } };
-  const keys = ['LARAVEL_CLOUD_TOKEN', 'LARAVEL_CLOUD_API_TOKEN', 'CLOUD_AXI_DOTENV_UNUSED'];
-  const previous = keys.map(key => process.env[key]);
-  try {
-    mkdirSync(join(root, '.git'));
-    mkdirSync(options.cwd);
-    for (const assignment of [
-      'LARAVEL_CLOUD_API_TOKEN=dotenv-credential',
-      'LARAVEL_CLOUD_API_TOKEN = "dotenv-credential" # comment',
-      "export LARAVEL_CLOUD_API_TOKEN='dotenv-credential'",
-    ]) {
-      const content = `# local credentials\r\nLARAVEL_CLOUD_TOKEN=ignored\r\n${assignment}\r\nCLOUD_AXI_DOTENV_UNUSED=$(touch ${marker})\r\n`;
-      writeFileSync(path, content, { mode: 0o600 });
-      const modified = statSync(path).mtimeMs;
-      const auth = await run(['auth'], [{ data: entity('org-1', { name: 'dotenv-credential' }) }], options);
-      assert.equal(auth.code, 0, auth.text);
-      assert.equal(auth.calls.length, 1);
-      assert.equal(auth.calls[0].headers.Authorization, 'Bearer dotenv-credential');
-      assert.equal(auth.data.organization.name, '[REDACTED]');
-      assert.equal(readFileSync(path, 'utf8'), content);
-      assert.equal(statSync(path).mtimeMs, modified);
-      assert.ok(keys.every((key, index) => process.env[key] === previous[index]), '.env must not change process.env.');
-      assert.equal(existsSync(marker), false);
-    }
-    const full = await run(['environment', 'view', 'env-1', '--full'], [{ data: entity('env-1', { build_command: `${'x'.repeat(995)}dotenv-credential` }) }], options);
-    assert.match(full.data.environment.build_command, /\[REDACTED\]$/);
-    assert.ok(!full.text.includes('dotenv-credential'));
-    const denied = await run(['auth'], [Response.json({ message: `${'x'.repeat(995)}dotenv-credential`, errors: { detail: ['dotenv-credential'] } }, { status: 401 })], options);
-    assert.equal(denied.data.code, 'AUTH_REQUIRED');
-    assert.equal(denied.calls.length, 1);
-    assert.ok(!denied.text.includes('dotenv-'), 'Redact .env credentials before truncation.');
-    const override = await run(['auth'], [{ data: entity('org-2') }], { ...options, clientOptions: { token: 'override-credential' } });
-    assert.equal(override.calls[0].headers.Authorization, 'Bearer override-credential');
-    assert.equal(existsSync(join(root, '.cloud')), false);
-    assert.equal(existsSync(join(root, '.config/cloud')), false);
-  } finally {
-    keys.forEach((key, index) => {
-      if (previous[index] === undefined) delete process.env[key];
-      else process.env[key] = previous[index];
-    });
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('.env lookup respects project boundaries, validates tokens, and keeps organization guards', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-dotenv-scope-'));
-  const cwd = join(root, 'repo');
-  const path = join(cwd, '.env');
-  const options = { cwd: join(cwd, 'sub'), homeDir: root, clientOptions: { token: '' } };
-  try {
-    mkdirSync(join(cwd, '.git'), { recursive: true });
-    mkdirSync(options.cwd);
-    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=outside-credential\n');
-    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_REQUIRED', 'Do not read .env above the Git root.');
-    for (const [content, code] of [
-      ['LARAVEL_CLOUD_TOKEN=ignored', 'AUTH_REQUIRED'],
-      ['LARAVEL_CLOUD_API_TOKEN=', 'AUTH_REQUIRED'],
-      ['LARAVEL_CLOUD_API_TOKEN="bad credential"', 'AUTH_INVALID'],
-      ['LARAVEL_CLOUD_API_TOKEN="bad\ncredential"', 'AUTH_INVALID'],
-    ]) {
-      writeFileSync(path, content);
-      const result = await run(['auth'], [], options);
-      assert.equal(result.data.code, code);
-      assert.equal(result.calls.length, 0);
-      assert.ok(!result.text.includes('bad credential'));
-    }
-    rmSync(path);
-    mkdirSync(path);
-    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_CONFIG_ERROR');
-    for (const argv of [['--help'], ['auth', '--help'], ['deploy', '--env', 'env-1', '--dry-run']]) {
-      const local = await run(argv, [], options);
-      assert.equal(local.code, 0, local.text);
-      assert.equal(local.calls.length, 0);
-    }
-    rmSync(path, { recursive: true });
-    writeFileSync(path, 'LARAVEL_CLOUD_API_TOKEN=dotenv-credential\n');
-    mkdirSync(join(root, '.config/cloud'), { recursive: true });
-    writeFileSync(join(root, '.config/cloud/config.json'), '{"api_tokens":[]}');
-    mkdirSync(join(cwd, '.cloud'));
-    writeFileSync(join(cwd, '.cloud/config.json'), '{"organization_id":"org-2"}');
-    const mismatch = await run(['deploy', '--env', 'env-1', '--confirm'], [{ data: entity('org-1') }], options);
-    assert.equal(mismatch.data.code, 'AUTH_ORGANIZATION');
-    assert.equal(mismatch.calls.length, 1);
-    assert.equal(mismatch.calls[0].method, 'GET');
-    const matched = await run(['app', 'list'], [{ data: entity('org-2') }, page([])], options);
-    assert.equal(matched.code, 0, matched.text);
-    assert.ok(matched.calls.every(call => call.headers.Authorization === 'Bearer dotenv-credential'));
-
-    writeFileSync(join(options.cwd, '.git'), 'gitdir: ../.git/worktrees/child\n');
-    assert.equal((await run(['auth'], [], options)).data.code, 'AUTH_REQUIRED', 'A nested Git root blocks the parent project.');
-    mkdirSync(join(options.cwd, '.cloud'));
-    writeFileSync(join(options.cwd, '.cloud/config.json'), '{}');
-    writeFileSync(join(options.cwd, '.env'), 'LARAVEL_CLOUD_API_TOKEN=child-credential\n');
-    const nested = await run(['auth'], [{ data: entity('org-3') }], options);
-    assert.equal(nested.code, 0, nested.text);
-    assert.equal(nested.calls[0].headers.Authorization, 'Bearer child-credential');
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
-
-test('deploy and command send exact targets and return operation state in the same call', async () => {
-  const deployment = await run(['deploy', '--env', 'env-1', '--confirm'], [{ data: entity('deploy-1', { status: 'pending' }) }]);
-  assert.equal(deployment.code, 0);
-  assert.equal(deployment.calls[0].url.pathname, '/api/environments/env-1/deployments');
-  assert.equal(deployment.calls[0].method, 'POST');
-  assert.equal(deployment.data.deployment.id, 'deploy-1');
-  const command = 'php artisan about; echo "hello"';
-  const result = await run(['command', 'run', '--env', 'env-2', '--command', command, '--confirm'], [{ data: entity('cmd-1', { status: 'pending' }) }]);
-  assert.deepEqual(JSON.parse(result.calls[0].body), { command });
-  assert.equal(result.data.command.id, 'cmd-1');
-});
-
-test('wait handles real Cloud statuses, failures and resumed operations', async () => {
-  const success = await run(['deploy', '--env', 'env-1', '--confirm', '--wait'], [
-    { data: entity('deploy-1', { status: 'pending' }) },
-    { data: entity('deploy-1', { status: 'build.succeeded' }) },
-    { data: entity('deploy-1', { status: 'deployment.succeeded' }) },
-  ], { sleep: async () => {} });
-  assert.equal(success.code, 0);
-  assert.equal(success.calls.length, 3);
-  assert.equal(success.calls.filter(call => call.method === 'POST').length, 1);
-  const failed = await run(['deployment', 'wait', 'deploy-1'], [{ data: entity('deploy-1', { status: 'build.failed', failure_reason: 'Build failed' }) }]);
+test('waits check exact native IDs, preserve status and stop without mutation retries', async () => {
+  const done = await run(['deployment', 'wait', 'depl-1'], [{ id: 'depl-1', status: 'build.running' }, { id: 'depl-1', status: 'deployment.succeeded' }], { sleep: async () => {} });
+  assert.equal(done.code, 0);
+  assert.equal(done.calls.length, 2);
+  assert.ok(done.calls.every(call => call.argv[0] === 'deployment:get'));
+  const failed = await run(['command', 'wait', 'comm-1', '--full'], [{ id: 'comm-1', status: 'command.failure', exitCode: 1, output: 'x'.repeat(2000) }]);
   assert.equal(failed.code, 1);
-  assert.equal(failed.data.deployment.failure_reason, 'Build failed');
-  const command = await run(['command', 'wait', 'cmd-1'], [{ data: entity('cmd-1', { status: 'command.failure', exit_code: 1, output: 'failed output' }) }]);
-  assert.equal(command.code, 1);
-  assert.equal(command.data.command.output, 'failed output');
-  const completeFailure = await run(['command', 'wait', 'cmd-1', '--full'], [{ data: entity('cmd-1', { status: 'command.failure', output: 'x'.repeat(2000) }) }]);
-  assert.equal(completeFailure.data.command.output.length, 2000);
-  const shortenedFailure = await run(['command', 'wait', 'cmd-1'], [{ data: entity('cmd-1', { status: 'command.failure', output: 'x'.repeat(2000) }) }]);
-  assert.match(shortenedFailure.data.command.output, /truncated, 2000 chars/);
-  const timeout = await run(['deployment', 'wait', 'deploy-1', '--timeout', '1'], [{ data: entity('deploy-1', { status: 'pending' }) }]);
-  assert.equal(timeout.code, 1);
-  assert.equal(timeout.data.code, 'WAIT_TIMEOUT');
-  assert.equal(timeout.data.deployment.id, 'deploy-1');
-  assert.equal(timeout.calls.length, 1);
+  assert.equal(failed.data.code, 'OPERATION_FAILED');
+  assert.equal(failed.data.command.output.length, 2000);
+  const wrong = await run(['deployment', 'wait', 'depl-1'], [{ id: 'depl-wrong', status: 'deployment.succeeded' }]);
+  assert.equal(wrong.data.code, 'WAIT_ERROR');
+  assert.equal(wrong.data.deployment.id, 'depl-1');
+  const deadline = await run(['deployment', 'wait', 'depl-1', '--timeout', '1'], [{ id: 'depl-1', status: 'pending' }]);
+  assert.equal(deadline.data.code, 'WAIT_TIMEOUT');
+  assert.equal(deadline.calls.length, 1);
 });
 
-test('start/stop are no-ops when the requested state already exists', async () => {
-  for (const [action, status] of [['start', 'running'], ['start', 'deploying'], ['stop', 'stopped']]) {
-    const result = await run(['environment', action, 'env-1', '--confirm'], [{ data: entity('env-1', { status }) }]);
-    assert.equal(result.code, 0);
-    assert.equal(result.data.changed, false);
-    assert.equal(result.calls.length, 1);
-  }
-  const stopped = await run(['environment', 'stop', 'env-1', '--confirm'], [
-    { data: entity('env-1', { status: 'running' }) }, { data: entity('env-1', { status: 'stopped' }) },
-  ]);
-  assert.equal(stopped.data.changed, true);
-  assert.equal(stopped.calls[1].url.pathname, '/api/environments/env-1/stop');
-});
-
-test('log cursor keeps its exact window and filters; deployment logs include previews', async () => {
-  const result = await run(['logs', '--env', 'env-1', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-01T01:00:00Z', '--query', 'error'], [
-    { data: [{ logged_at: '2026-01-01T00:01:00Z', level: 'error', type: 'application', message: 'oops' }], meta: { cursor: 'cursor-2' } },
-  ]);
+test('native usage maps billing periods and real camelCase totals', async () => {
+  const result = await run(['usage', '--period', '0'], [{ currency: 'USD', period: 0, currentSpendCents: 123, applicationCount: 1 }]);
   assert.equal(result.code, 0);
-  assert.equal(result.data.total, null);
-  assert.ok(result.data.help[0].includes('--from'));
-  assert.ok(result.data.help[0].includes('--to'));
-  assert.ok(result.data.help[0].includes('--query'));
-  assert.ok(result.data.help[0].includes('--cursor'));
-  const logs = await run(['deployment', 'logs', 'deploy-1'], [{ data: { build: { available: true, steps: [{ output: 'x'.repeat(2000) }] }, deploy: { available: false, steps: [] } }, meta: { deployment_status: 'build.failed' } }]);
-  assert.equal(logs.code, 0);
-  assert.match(logs.text, /truncated/);
+  assert.deepEqual(result.calls[0].argv.slice(0, 2), ['usage', '--period=current']);
+  assert.equal(result.data.usage.currentSpendCents, 123);
+  const selected = await run(['usage', '--period', '2', '--fields', 'currency,currentSpendCents'], [{ currency: 'USD', currentSpendCents: 42 }]);
+  assert.deepEqual(selected.calls[0].argv.slice(0, 2), ['usage', '--period=2']);
+  assert.equal(Object.keys(selected.data.usage).length, 2);
+  const empty = await run(['auth'], [[]]);
+  assert.equal(empty.data.authenticated, true);
+  assert.deepEqual(empty.data.organizations, []);
+  assert.match(empty.data.message, /No organization identity/);
 });
 
-test('context stays at the repo boundary, uses the cwd outside Git and preserves config keys', async () => {
+test('context, exact linked home and idempotent local link preserve unrelated settings', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-axi-context-'));
+  const cwd = join(root, 'project');
   try {
-    const cwd = join(root, 'repo');
     mkdirSync(join(cwd, '.git'), { recursive: true });
     mkdirSync(join(cwd, 'sub'));
-    assert.equal(context(join(cwd, 'sub')).directory, cwd);
-    const plain = join(root, 'plain');
-    mkdirSync(plain);
-    assert.equal(context(plain).directory, plain);
     mkdirSync(join(cwd, '.cloud'));
-    writeFileSync(join(cwd, '.cloud/config.json'), JSON.stringify({ unrelated: true, organization_id: 'org-stale' }));
-    const responses = [{ data: entity('app-1') }, { data: entity('env-1', { status: 'running', name: 'Production' }, { application: { data: { id: 'app-1' } } }) }, { data: entity('org-1') }];
-    const linked = await run(['link', '--app', 'app-1', '--env', 'env-1'], [...responses], { cwd });
-    assert.equal(linked.code, 0);
+    writeFileSync(join(cwd, '.cloud/config.json'), '{"unrelated":true}');
+    assert.equal(context(join(cwd, 'sub')).directory, cwd);
+    assert.equal(context(root).directory, root);
+    const linked = await run(['link', '--app', 'app-1', '--env', 'env-1'], [app(), environment()], { cwd });
+    assert.equal(linked.code, 0, linked.text);
     assert.equal(linked.data.changed, true);
-    const config = JSON.parse(readFileSync(join(cwd, '.cloud/config.json'), 'utf8'));
-    assert.equal(config.unrelated, true);
-    assert.equal(config.environment_id, 'env-1');
-    assert.equal(config.organization_id, 'org-1', 'Link must replace a stale organization when an override selects another account.');
-    assert.equal(linked.data.organization, 'org-1');
-    assert.equal(statSync(join(cwd, '.cloud/config.json')).mode & 0o777, 0o600);
-    const again = await run(['link', '--app', 'app-1', '--env', 'env-1'], [...responses], { cwd });
-    assert.equal(again.data.changed, false);
-    const home = await run([], [responses[2], responses[1]], { cwd: join(cwd, 'sub') });
-    assert.equal(home.data.environment.name, 'Production');
-    assert.equal(home.calls[1].url.pathname, '/api/environments/env-1');
-    const noDefaultMutation = await run(['deploy', '--confirm'], [], { cwd });
-    assert.equal(noDefaultMutation.code, 2);
-    const wrong = await run(['link', '--app', 'app-2', '--env', 'env-1'], [...responses], { cwd });
-    assert.equal(wrong.code, 2);
-    assert.equal(JSON.parse(readFileSync(join(cwd, '.cloud/config.json'), 'utf8')).application_id, 'app-1');
-    writeFileSync(join(cwd, '.cloud/config.json'), '{broken');
-    const broken = await run([], [], { cwd });
-    assert.equal(broken.data.code, 'CONFIG_ERROR');
-    assert.equal(broken.calls.length, 0);
+    const configPath = join(cwd, '.cloud/config.json');
+    const original = readFileSync(configPath, 'utf8');
+    assert.equal(JSON.parse(original).unrelated, true);
+    assert.equal(JSON.parse(original).organization_id, 'org-1');
+    assert.equal(statSync(configPath).mode & 0o777, 0o600);
+    const modified = statSync(configPath).mtimeMs;
+    const repeated = await run(['link', '--app', 'app-1', '--env', 'env-1'], [app(), environment()], { cwd });
+    assert.equal(repeated.data.changed, false);
+    assert.equal(statSync(configPath).mtimeMs, modified);
+    const home = await run([], [environment()], { cwd: join(cwd, 'sub') });
+    assert.equal(home.data.environment.id, 'env-1');
+    assert.equal(home.data.instances_count, 1);
+    assert.equal(home.calls[0].cwd, cwd);
+    const mismatch = await run(['link', '--app', 'app-1', '--env', 'env-missing'], [app(), environment()], { cwd });
+    assert.equal(mismatch.data.code, 'TARGET_MISMATCH');
+    assert.equal(readFileSync(configPath, 'utf8'), original);
+    const wrongParent = await run([], [{ ...environment(), application: { id: 'app-wrong' } }], { cwd });
+    assert.equal(wrongParent.data.code, 'CONFIG_ERROR');
+    writeFileSync(configPath, '{broken');
+    const bad = await run([], [], { cwd });
+    assert.equal(bad.data.code, 'CONFIG_ERROR');
+    assert.equal(bad.calls.length, 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('bare version uses no command graph and stays close to node startup cost', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-version-'));
+  try {
+    mkdirSync(join(root, 'bin'));
+    copyFileSync(bin, join(root, 'bin/laravel-cloud-axi.js'));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ type: 'module', version: '9.8.7' }));
+    const times = [];
+    for (const flag of ['-v', '-V', '--version']) {
+      const start = performance.now();
+      const child = spawnSync(process.execPath, [join(root, 'bin/laravel-cloud-axi.js'), flag], { encoding: 'utf8' });
+      times.push(performance.now() - start);
+      assert.equal(child.status, 0);
+      assert.equal(child.stdout, '9.8.7\n');
+      assert.equal(child.stderr, '');
+    }
+    const floor = [];
+    for (let i = 0; i < 3; i++) {
+      const start = performance.now();
+      spawnSync(process.execPath, ['-e', 'console.log(1)']);
+      floor.push(performance.now() - start);
+    }
+    assert.ok(Math.min(...times) < Math.min(...floor) * 4, `version ${Math.min(...times)}ms, node floor ${Math.min(...floor)}ms`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 test('opt-in hooks install, repeat, and remove without changing unrelated settings', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-axi-hooks-'));
   const previousArgv = process.argv[1];
@@ -532,56 +441,59 @@ test('opt-in hooks install, repeat, and remove without changing unrelated settin
   }
 });
 
-test('executable reuses official Cloud login across processes without keyring services', () => {
-  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-bin-'));
+
+test('native scope ignores nested project config and parent configs outside Git', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-native-scope-'));
   try {
-    mkdirSync(join(root, '.git'));
-    mkdirSync(join(root, 'bin'));
-    copyFileSync(bin, join(root, 'bin/laravel-cloud-axi.js'));
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ type: 'module', version: '9.8.7' }));
-    for (const flag of ['-v', '-V', '--version']) {
-      const child = spawnSync(process.execPath, [join(root, 'bin/laravel-cloud-axi.js'), flag], { encoding: 'utf8' });
-      assert.equal(child.status, 0);
-      assert.equal(child.stdout, '9.8.7\n');
-      assert.equal(child.stderr, '');
-    }
-    mkdirSync(join(root, '.config/cloud'), { recursive: true });
-    const login = join(root, '.config/cloud/config.json');
-    const content = JSON.stringify({ api_tokens: ['saved-credential'] });
-    writeFileSync(login, content, { mode: 0o600 });
-    const preload = join(root, 'offline.mjs');
-    writeFileSync(preload, `globalThis.fetch = async (url, request) => {
-        if (url.href !== 'https://cloud.laravel.com/api/meta/organization' || request.method !== 'GET'
-          || request.headers.Authorization !== 'Bearer ' + process.env.CLOUD_AXI_TEST_EXPECTED) throw new Error('Unexpected authentication request');
-        return Response.json({ data: { id: 'org-1', attributes: { name: process.env.CLOUD_AXI_TEST_EXPECTED } } });
-      };`);
-    function invoke(args, environment = {}) {
-      const child = spawnSync(process.execPath, ['--import', preload, bin, ...args], {
-        cwd: root, env: { ...process.env, HOME: root, USERPROFILE: root, DBUS_SESSION_BUS_ADDRESS: `unix:path=${root}/no-bus`, LARAVEL_CLOUD_TOKEN: 'legacy-credential', LARAVEL_CLOUD_API_TOKEN: '', ...environment },
-        encoding: 'utf8', timeout: 5000,
-      });
-      assert.equal(child.stderr, '');
-      assert.ok(!child.stdout.includes('-credential'));
-      return { status: child.status, data: decode(child.stdout) };
-    }
-    for (const HOME of [root, '']) {
-      const saved = invoke(['auth'], { HOME, CLOUD_AXI_TEST_EXPECTED: 'saved-credential', LARAVEL_CLOUD_API_TOKEN: 'environment-credential' });
-      assert.equal(saved.status, 0);
-      assert.equal(saved.data.source, 'cloud-cli');
-      assert.equal(saved.data.organization.name, '[REDACTED]');
-      assert.equal(readFileSync(login, 'utf8'), content);
-    }
-    rmSync(login);
-    const missing = invoke(['auth']);
-    assert.equal(missing.status, 1);
-    assert.equal(missing.data.code, 'AUTH_REQUIRED', 'LARAVEL_CLOUD_TOKEN is not an authentication source.');
-    const environment = invoke(['auth'], { CLOUD_AXI_TEST_EXPECTED: 'environment-credential', LARAVEL_CLOUD_API_TOKEN: 'environment-credential' });
-    assert.equal(environment.status, 0);
-    assert.equal(environment.data.source, 'environment');
-    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=dotenv-credential\n');
-    const dotenv = invoke(['auth'], { CLOUD_AXI_TEST_EXPECTED: 'dotenv-credential' });
-    assert.equal(dotenv.status, 0);
-    assert.equal(dotenv.data.source, 'dotenv');
-    assert.equal(existsSync(login), false, 'Fallback credentials are not copied into a login file.');
+    const repo = join(root, 'repo');
+    const sub = join(repo, 'sub');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    mkdirSync(join(repo, '.cloud'));
+    mkdirSync(join(sub, '.cloud'), { recursive: true });
+    writeFileSync(join(repo, '.cloud/config.json'), '{"application_id":"app-root"}');
+    writeFileSync(join(sub, '.cloud/config.json'), '{"application_id":"app-nested"}');
+    writeFileSync(join(repo, '.env'), 'LARAVEL_CLOUD_API_TOKEN=root-synthetic');
+    writeFileSync(join(sub, '.env'), 'LARAVEL_CLOUD_API_TOKEN=nested-synthetic');
+    assert.equal(context(sub).data.application_id, 'app-root');
+    const fallback = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { cwd: sub });
+    assert.equal(fallback.calls[2].cwd, repo);
+    assert.equal(fallback.calls[2].env.LARAVEL_CLOUD_TOKEN, 'root-synthetic');
+    const plain = join(root, 'plain');
+    mkdirSync(plain);
+    mkdirSync(join(root, '.cloud'));
+    writeFileSync(join(root, '.cloud/config.json'), '{"application_id":"app-parent"}');
+    writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=parent-synthetic');
+    assert.equal(context(plain).directory, plain);
+    assert.deepEqual(context(plain).data, {});
+    const noFallback = await run(['auth'], [noLogin], { cwd: plain });
+    assert.equal(noFallback.data.code, 'AUTH_REQUIRED');
+    assert.equal(noFallback.calls.length, 1, 'No fallback needs no version probe or upgrade.');
+    const worktree = join(root, 'worktree');
+    mkdirSync(join(worktree, 'sub'), { recursive: true });
+    writeFileSync(join(worktree, '.git'), 'gitdir: ../repo/.git/worktrees/one\n');
+    assert.equal(context(join(worktree, 'sub')).directory, worktree);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the executable uses CLOUD_BIN, structured stdout, and no real credentials', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-axi-executable-'));
+  try {
+    const binary = join(root, 'cloud.mjs');
+    copyFileSync(new URL('./fixtures/cloud.txt', import.meta.url), binary);
+    chmodSync(binary, 0o700);
+    writeFileSync(join(root, 'steps.json'), JSON.stringify([{ stdout: JSON.stringify([app()]) }]));
+    const env = { PATH: process.env.PATH, HOME: root, USERPROFILE: root, CLOUD_BIN: binary };
+    const child = spawnSync(process.execPath, [bin, 'auth'], { cwd: root, env, encoding: 'utf8', timeout: 5000 });
+    assert.equal(child.status, 0, child.stdout);
+    assert.equal(child.stderr, '');
+    assert.equal(decode(child.stdout).source, 'cloud-cli');
+    assert.equal(existsSync(join(root, '.config')), false);
+    assert.equal(existsSync(join(root, '.cloud')), false);
+    const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8');
+    const bad = spawnSync(process.execPath, [bin, 'app', 'list', '--bad'], { cwd: root, env, encoding: 'utf8', timeout: 5000 });
+    assert.equal(bad.status, 2);
+    assert.equal(bad.stderr, '');
+    assert.match(decode(bad.stdout).error, /--bad/);
+    assert.equal(readFileSync(join(root, 'calls.jsonl'), 'utf8'), calls);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

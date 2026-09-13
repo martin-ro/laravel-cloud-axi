@@ -1,0 +1,24 @@
+#!/usr/bin/env node
+import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+
+const root = dirname(fileURLToPath(import.meta.url));
+let input = '';
+for await (const chunk of process.stdin) input += chunk;
+const calls = join(root, 'calls.jsonl');
+appendFileSync(calls, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), env: process.env, stdin: input, tty: Boolean(process.stdin.isTTY) }) + '\n');
+const steps = JSON.parse(readFileSync(join(root, 'steps.json'), 'utf8'));
+const indexPath = join(root, 'index');
+let index = 0;
+try { index = Number(readFileSync(indexPath, 'utf8')); } catch {}
+writeFileSync(indexPath, String(index + 1));
+const step = steps[index];
+if (!step) { process.stderr.write('Unexpected invocation'); process.exit(90); }
+if (step.childMarker) spawn(process.execPath, ['-e', `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(step.childMarker)}, 'leaked'), 900)`], { stdio: 'ignore' });
+if (step.delay) await new Promise(resolve => setTimeout(resolve, step.delay));
+if (step.bytes) process.stdout.write('x'.repeat(step.bytes));
+else process.stdout.write(step.stdout ?? '');
+process.stderr.write(step.stderr ?? '');
+process.exitCode = step.code ?? 0;

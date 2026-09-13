@@ -1,26 +1,24 @@
 # laravel-cloud-axi
 
-An [AXI](https://axi.md/) for Laravel Cloud: compact TOON output, live project state, and guarded operations for coding agents.
+An [AXI](https://github.com/kunchenguid/axi) wrapper around official Laravel Cloud commands, like [gh-axi](https://github.com/kunchenguid/gh-axi) wraps `gh`. It adds compact TOON output, input validation, exact read-target checks, and optional agent session context.
 
-Uses the [Laravel Cloud API](https://laravel.com/cloud/docs/api/introduction) directly. The official Cloud CLI owns browser login and credential storage, just as `gh` owns authentication for `gh-axi`. API calls reuse that saved login and do not need PHP or the `cloud` executable. The [AXI SDK](https://github.com/kunchenguid/axi/tree/main/packages/axi-sdk-js) supplies the command runtime and optional session hooks.
+Production Cloud operations use the `cloud` executable through argv subprocesses. There is no HTTP client, PHP shim, separate login, keyring, saved-token parser, or general command passthrough. The installed AXI SDK supplies the command runtime and hooks. The TOON encoder runs at the output boundary; internal values stay JSON.
 
-## Install from this checkout
+## Install
 
-Requires Node.js 22 or later.
+Requires Node.js 22 or later and the [official Cloud CLI](https://github.com/laravel/cloud-cli). Command mappings were checked against v0.5.0. API-token fallback requires v0.6.0 or later in the 0.x series.
 
 ```sh
 npm ci
 node bin/laravel-cloud-axi.js --help
-
-# Optional: expose laravel-cloud-axi on PATH.
 npm install -g .
 ```
 
-The examples below assume the PATH install. Otherwise use `node /path/to/laravel-cloud-axi/bin/laravel-cloud-axi.js` in its place. This project has not been published to npm.
+Examples below use the optional PATH install. Without it, use `node /absolute/checkout/bin/laravel-cloud-axi.js`. This package is not published to npm. `CLOUD_BIN` can select a trusted official executable path; it is not a shell command. The wrapper does not update the official CLI or itself.
 
-## Authentication
+## Authentication and native limits
 
-Log in once with the [official Laravel Cloud CLI](https://github.com/laravel/cloud-cli):
+Log in yourself, outside an agent session:
 
 ```sh
 cloud auth
@@ -28,113 +26,111 @@ laravel-cloud-axi auth
 laravel-cloud-axi
 ```
 
-Run `cloud auth` once for the official browser login. Later terminals and agents reuse its saved credentials. `laravel-cloud-axi auth` (or `auth status`) only checks access and reports the organization and source. There is no separate login, token prompt, logout, or keyring implementation in this CLI. Secret Service is not required.
+`auth` and `auth status` check access through `application:list`. They never invoke `auth` or `auth:token`. They report the source and organization identities returned with applications. An empty organization can pass the access check without returning its identity.
 
 Credential order:
 
-1. The official Cloud CLI login: `api_tokens` in `~/.config/cloud/config.json`.
-2. If no tokens are saved, `LARAVEL_CLOUD_API_TOKEN` in the process environment.
-3. Otherwise, `LARAVEL_CLOUD_API_TOKEN` in the project's `.env`.
+1. Run the native read with no token override. The official CLI selects its saved login.
+2. Only an exact native no-saved-login error permits `LARAVEL_CLOUD_API_TOKEN` from the process environment.
+3. Otherwise use that same variable from the project's `.env`.
 
-The old `LARAVEL_CLOUD_TOKEN` variable is not used by this CLI. Invalid credentials, unreadable login files, and ambiguous saved logins fail rather than switching to another source. API-token fallbacks do not replace a saved login.
+Fallback is delegated as the child's `LARAVEL_CLOUD_TOKEN`, supported by native v0.6.0. It is never copied to a token file or command argument. The initial native attempt withholds both token variables. A caller's `LARAVEL_CLOUD_TOKEN` is not a wrapper credential source. Invalid saved credentials, ambiguous logins, timeouts, malformed responses and credential rejection do not switch sources. The read is repeated once only after an explicit missing-login result and a compatible version check. Subsequent reads in that invocation use the same fallback.
 
-With multiple saved tokens, run `cloud repo:config` once in the project to select an organization. Its `.cloud/config.json` `organization_id` selects the matching token. Expired tokens are skipped during this read-only lookup, not removed from the login file. A missing or unmatched selection fails before the requested operation. A single token is also checked against a saved project organization. `link` can update that organization after validating the requested application and environment.
+No saved login and no fallback means `AUTH_REQUIRED`. With a fallback but native v0.5.0, save a login yourself or upgrade the official CLI. `.env` is read only after the explicit no-login result. Quotes and comments work. Variables and shell expressions are not executed. The wrapper does not change `.env` or `process.env`.
 
-The official CLI currently stores tokens in a **plaintext file**. It owns that storage decision; this CLI only reads the file and never copies or rewrites its credentials. Run `cloud auth` again if the login expires. Home resolution follows the official CLI: `HOME`, then `USERPROFILE`, then the system home directory.
+**Upstream safety limit:** native v0.5.0 and v0.6.0 can start OAuth and open a browser when all stored tokens expire. Closed stdin, CI mode and `--no-interaction` do not prevent that branch. Agent-detection environment markers are withheld, but native detection can also use files. Each subprocess has a 10-second hard deadline and process cleanup. This bounds waiting; it does not guarantee that native login or a browser cannot start. The wrapper does not implement a second authentication system to work around this provider behavior.
 
-For `.env`, use the directory containing `.cloud/config.json`, or the Git root when unlinked, or the current directory outside Git. Lookup does not cross a Git root. Quotes and comments work; variables and shell commands are not expanded or executed. Only the named token is used, without changing the process environment or writing the file.
+The official CLI owns token selection and storage. It can remove expired saved tokens during ordinary reads. This wrapper does not read, copy or write the saved credential file, and cannot promise that the provider leaves it unchanged. With multiple saved tokens, run `cloud repo:config` yourself in a Git project to select the organization. Outside Git, set `organization_id` in `.cloud/config.json`. Native single-token selection does not assert a saved organization ID. Use read-only credentials where possible.
 
-For CI, supply `LARAVEL_CLOUD_API_TOKEN` through a secret manager. This needs neither PHP nor the official CLI. Use read-only permissions unless an operation needs write access. Keep `.env` out of Git. Never put real tokens in shell history or commits.
+## Supported commands
 
-## Link a project
+Every subcommand has concise `--help` with flags and examples. Unknown flags are rejected before any dependency call, including when combined with `--help`. Use exact IDs, not names. A returned ID that differs from the requested ID is an error, not a successful fallback.
+
+| Command | Native operation |
+| --- | --- |
+| `app list`, `app view <id>` | `application:list`, `application:get <id>` |
+| `environment list --app <id>` | Exact-checked `application:get <id>`, then its included environments |
+| `environment view <id>` | `environment:get <id>` |
+| `deployment view <id>`, `deployment wait <id>` | `deployment:get <id>` |
+| `command view <id>`, `command wait <id>` | `command:get <id>` |
+| `instance view <id>` | `instance:get <id>` |
+| `domain view <id>` | `domain:get <id>` |
+| `database list`, `database view <id>` | `database-cluster:list`, `database-cluster:get <id>` |
+| `cache list`, `cache view <id>` | `cache:list`, `cache:get <id>` |
+| `bucket list`, `bucket view <id>` | `bucket:list`, `bucket:get <id>` |
+| `usage --period 0` | `usage --period=current`, organization billing |
+| `auth`, `auth status` | Access check with `application:list` |
+| `link --app <id> --env <id>` | Exact application and environment reads, then local config write |
+| `setup hooks [--status\|--remove]` | Opt-in local agent configuration |
+
+A noun without an action selects its list. `home` and no arguments show live state. Linked home shows the environment, current deployment ID and available instance count. Unlinked home lists applications. No-argument output includes the executable path and a short description. Bare `-v`, `-V`, and `--version` load no command graph and print only the package version.
+
+### Project scope
 
 ```sh
 laravel-cloud-axi app list
-laravel-cloud-axi environment list --app <application-id>
-laravel-cloud-axi link --app <application-id> --env <environment-id>
+laravel-cloud-axi environment list --app <id>
+laravel-cloud-axi link --app <id> --env <id>
 laravel-cloud-axi
 ```
 
-`link` verifies that the environment belongs to the application. It saves the application, environment, and authenticated organization IDs in `.cloud/config.json`, the same project file used by the official Cloud CLI. Other keys are preserved. Writes are atomic and use mode `0600`. Repeating the same link is a no-op.
+Scope matches native `LocalConfig`: the Git root, including worktree `.git` files, otherwise the current directory. Nested `.cloud` files inside Git and parent configs outside Git are not used. Native subprocesses run in this same directory. `.env`, link, read defaults and hooks use this scope too.
 
-Read commands find the nearest `.cloud/config.json`, without crossing a Git root. Outside Git, a new link is written in the current directory. Explicit read flags override the linked IDs. Billing is organization-wide unless `--env` is given.
+`link` validates both returned IDs, environment membership and the application's organization ID before saving `.cloud/config.json`. Other keys are preserved. The write is atomic with mode `0600`. An unchanged link is a local no-op. It does not change credential storage or override native organization selection. Explicit read flags override linked target IDs.
 
-With a linked environment, no arguments show its status, current deployment ID, and instance count. Without a link, no arguments list applications.
-
-## Commands
-
-Every command supports `--help`. Flags go after the command. Resource names are not resolved: use exact IDs from list output.
-
-| Command | Purpose |
-| --- | --- |
-| `app list`, `app view <id>` | Applications |
-| `environment list --app <id>`, `environment view <id>` | Environments |
-| `deployment list --env <id>`, `deployment view <id>` | Deployment history and details |
-| `deployment logs <id>` | Build and deployment logs |
-| `deployment wait <id> --timeout 300` | Wait for an existing deployment |
-| `deploy --env <id> --dry-run` | Preview a deployment request |
-| `deploy --env <id> --confirm --wait` | Deploy and return its final state |
-| `command list --env <id>`, `command view <id>` | Remote command history and output |
-| `command run --env <id> --command "php artisan about" --confirm --wait` | Run a remote command |
-| `command wait <id> --timeout 300` | Wait for an existing remote command |
-| `environment start <id> --confirm` | Start and deploy an environment |
-| `environment stop <id> --confirm` | Stop an environment and cancel active deployments |
-| `logs --env <id> --since 1h --query "error"` | Search environment logs |
-| `instance list --env <id>`, `instance view <id>` | Compute instances |
-| `domain list --env <id>`, `domain view <id>` | Domain and TLS state |
-| `database list`, `database view <id>` | Database clusters, not individual schemas |
-| `cache list`, `cache view <id>` | Caches |
-| `bucket list`, `bucket view <id>` | Object storage buckets |
-| `usage --period 0 --env <id>` | Billing totals and environment usage in cents |
-| `auth`, `auth status` | Check credential source and organization; login with `cloud auth` |
-| `setup hooks [--status\|--remove]` | Optional project session hooks |
-
-A resource noun without an action runs its list command. For example, `cache` means `cache list`.
-
-### Output and pagination
+### Output
 
 ```text
-count: 2
-total: 2
-page: 1
+scope: selected organization
+count: 1
+total: 1
 has_more: false
-app[2]{id,name,region,repository.full_name}:
-  app-example1,Store,us-east-2,acme/store
-  app-example2,Docs,eu-central-1,acme/docs
-help[2]: laravel-cloud-axi app view <id>,laravel-cloud-axi environment list --app <id>
+app[1]{id,name,region,repositoryFullName}:
+  app-example,Store,us-east-2,acme/store
 ```
 
-- Lists return one complete API page with 3 or 4 fields per row. Page size is set by Cloud.
-- `--page 2` reads another page. `--all` reads all pages from the selected page, up to 100 pages. The reported page is the last page read. A failed page fails the command, not a partial success.
-- `count` is the number returned. `total` is the server total. `null` means the API did not supply a total, including for logs.
-- Empty results include an explicit zero-result message.
-- `--fields id,name,status` selects fields. Field names use API snake_case. Dotted paths such as `repository.full_name` work. Missing fields return `null`.
-- Detail views include attributes and available relationship IDs/counts. Strings stop at 1000 characters with a size hint. `--full` returns complete text, not additional pages.
-- Filters differ by resource. For example, `deployment list --env <id> --status build.failed` uses a server-side filter. Use the command's `--help` for all accepted flags.
-- All results and errors go to stdout as TOON. Exit codes are `0` for success, `1` for operational failures, and `2` for invalid input. Wait commands return `1` for a failed remote operation.
+- Supported native lists collect all pages. AXI displays at most 100 rows by default. `--limit` changes the display limit; `--all` shows the full returned collection. They cannot reduce native network work or output size.
+- Filters are local exact matches on the complete returned collection, before display limiting. Counts refer to the filtered scope. Empty results state zero with scope. `has_more` means hidden display rows, not a provider cursor.
+- `--fields id,name,status` selects native camelCase fields. Dotted paths work. Missing fields return `null`. Default list rows have 3 or 4 columns.
+- Detail strings have a 1000-character preview, total length and a conditional `--full` hint. `--full` expands text, never structured secrets.
+- `usage` uses native camelCase integer-cent fields. Periods `0..3` remain supported, with `0` mapped to `current`.
+- Wait commands poll existing operations only. Default deadline: 300 seconds; maximum: 3600 seconds. A deadline does not cancel remote work. Remote failure returns exit 1 with the last checked result.
+- All data and errors go to stdout as TOON. Exit codes: 0 success or local no-op, 1 failure, 2 invalid input. Raw dependency errors and stack traces are not forwarded. One JSON document is required for reads; progress JSON lines are not treated as a final result.
 
-Environment logs default to the last hour. `--from` and `--to` require ISO 8601 timestamps with timezones. Cursor continuation must retain both timestamps and all filters; the next-step hint carries them forward. Log `--type` accepts `application`, `access`, or `all`.
+## Migration from the HTTP implementation
 
-## Operation safety
+This is a reduced, read-focused surface, not feature parity.
 
-- Mutations require an explicit target ID and `--confirm`. They never use linked target defaults. All environments, including production, use this gate.
-- `--dry-run` validates the input and prints the request without an API call. It does not check remote permissions or resource existence.
-- Deployments and remote commands are not idempotent. Each confirmed invocation creates a new operation. They are never retried automatically.
-- Start is a no-op when the environment is running or deploying. Stop is a no-op when it is stopped. Otherwise the API performs the state change.
-- Without `--wait`, deployment and command creation return their operation IDs. With `--wait`, polling stops after 300 seconds by default, with a maximum of 3600 seconds. Timeout does not cancel remote work. Resume with the corresponding `wait <id>` command.
-- After a network failure or uncertain mutation result, inspect deployment or command history before repeating it.
-- API requests have a 10-second timeout and a 5 MiB response limit. Redirects are refused. Pagination must stay on the same HTTPS origin and resource path. There is no API-host override.
-- Known structured credential fields and the configured API token are redacted, including with `--full`. This is not a secret scanner: logs, command strings, and arbitrary free text can still contain other secrets. Review them before sharing.
+| Earlier behavior | Current behavior and alternative |
+| --- | --- |
+| Direct API calls without PHP or `cloud` | Official executable and its runtime are required |
+| Environment/.env fallback with any native version | Requires v0.6.0, only after an explicit no-saved-login result |
+| Wrapper selected saved tokens and asserted organization | Native CLI owns token and organization selection |
+| API snake_case `--fields` | Native camelCase, for example `repositoryFullName`, `exitCode`, `currentDeploymentId` |
+| `--page` | Targeted usage error: use `--limit` or `--all` |
+| Server-side list filters | Local exact filters on complete supported collections |
+| `deployment`, `command`, `instance`, `domain` lists | Unsupported: native list output cannot prove its resolved environment, including empty results |
+| Environment logs and deployment logs | Unsupported: environment scope/pagination cannot be proved; deployment logs has no native command |
+| `usage --env` | Unsupported: native output does not identify its resolved environment |
+| `deploy`, `command run` | Unsupported: native resolvers can fall back to another target after a failed exact lookup |
+| Environment start/stop | Unsupported: no native command |
+| Nearest `.cloud/config.json` lookup | Git root, otherwise current directory |
 
-This version does not create or delete infrastructure, change environment variables, manage secret values, or provide an unrestricted API passthrough. Use the Cloud dashboard for those operations.
+Use `environment view <id> --fields deploymentIds,currentDeploymentId,instances,domainIds` to inspect available related IDs. These relationship arrays are not a promise of complete history. For command IDs, logs, environment billing, full history or remote writes, use the Cloud dashboard yourself.
+
+Legacy unsupported commands remain as explicit errors with targeted help. `--confirm` cannot enable them. Their `--dry-run` returns `supported: false`, sends nothing and does not print a fake HTTP request or claim a mutation will work. Preflight reads cannot make a later native write safe when its second resolver can fall back. No remote mutation is sent or retried. Local link and hook setup are the only supported mutations and are idempotent.
+
+## Subprocess and data safety
+
+Native reads use argv execution without a shell, closed stdin, `--json`, `--no-interaction` and `--no-ansi`. Runtime paths and network trust/proxy settings are inherited. Agent markers, PHP injection settings, `CLOUD_BASE_URL`, and unrelated variables are not. The API host cannot be changed through this wrapper. Only listed native read commands can run; no unrestricted passthrough exists.
+
+Combined stdout/stderr is bounded to 5 MiB. On timeout or excess output the process is killed. On POSIX, cleanup also kills its process group. This cannot undo a browser or network action already performed by native code. Windows process-tree cleanup and hook behavior are not validated.
+
+Structured credential fields are redacted, including camelCase environment variables and connection data. Configured fallback values are removed from output before truncation. Saved tokens are unknown to the wrapper, and arbitrary free text can contain other secrets. This is not a general secret scanner. Review resource text before sharing it.
 
 ## Agent integration
 
-Choose a session hook for automatic context or the skill for on-demand guidance. Only one is needed.
-
-### Session hooks
-
-After linking a project, explicitly install hooks:
+Choose the hook first for automatic live context, or the generated skill for on-demand guidance. Only one is needed; both can be installed.
 
 ```sh
 laravel-cloud-axi setup hooks
@@ -142,33 +138,19 @@ laravel-cloud-axi setup hooks --status
 laravel-cloud-axi setup hooks --remove
 ```
 
-Setup uses the SDK to install project-scoped integrations for:
+Setup requires explicit intent, a linked project and a persistent install. Normal commands never install hooks. The SDK manages project Claude Code `.claude/settings.json`, Codex `.codex/hooks.json`, and OpenCode `.opencode/plugins/laravel-cloud-axi.js`. Codex setup also enables the shared `hooks = true` feature in `~/.codex/config.toml`. Removal preserves that shared feature and unrelated settings.
 
-- Claude Code: `.claude/settings.json`
-- Codex: `.codex/hooks.json`
-- OpenCode: `.opencode/plugins/laravel-cloud-axi.js`
+Repeated installation with the same path is a no-op. Setup repairs paths after relocation. A PATH-verified executable is preferred; otherwise the SDK uses its absolute path. Setup rejects unsafe fallback paths because the SDK does not quote them. No session transcripts or session-end history are collected. The session context uses the same native authentication limits described above.
 
-Codex also needs the shared `hooks = true` feature in **`~/.codex/config.toml`**. Setup enables that user-level feature. Removing hooks leaves the shared feature enabled and preserves unrelated configuration.
-
-Normal commands never install hooks. Setup repairs the executable path after relocation. Repeating setup with the same path does not rewrite files. Hooks use the linked project and the same credential order: official Cloud CLI login, then `LARAVEL_CLOUD_API_TOKEN` from the environment or `.env`. No session transcripts are collected.
-
-Use a persistent installation for hooks, not an `npx` cache. The current SDK does not quote fallback executable paths, so setup rejects paths with spaces or shell metacharacters. Hook integration is tested on Linux; Windows is not validated.
-
-### On-demand skill
-
-The generated skill is at [`skills/laravel-cloud-axi/SKILL.md`](skills/laravel-cloud-axi/SKILL.md). Install or copy that directory through your agent's skill system. It uses an absolute checkout path, so a global executable is not required.
+The installable skill is [`skills/laravel-cloud-axi/SKILL.md`](skills/laravel-cloud-axi/SKILL.md). Install or copy that directory through your agent's skill system. It uses an absolute checkout command, so a global install is not required. It is generated from shared CLI guidance without live state.
 
 ## Development
 
 ```sh
-npm ci
 npm run skill
 npm run check
+git diff --check
 npm pack --dry-run
 ```
 
-Tests use Node's built-in test runner and simulated Cloud responses. They cover input validation, saved login selection, `.env` fallback, credential overrides, API errors, pagination, redaction, operation status, context persistence, hooks, and executable behavior. They do not need a Cloud account and never call the live API.
-
-The skill is generated from the CLI's shared guidance. `npm run check` fails when it is stale. GitHub Actions runs these checks on Node 22 and 24.
-
-API mappings were checked against the [official OpenAPI document](https://cloud.laravel.com/api-docs/api.json). Live deployments and account-specific permissions still need a separate, approved smoke test.
+Tests are offline. An executable fake `cloud` records argv, cwd, environment and stdin. Tests cover validation, native DTO shapes/signatures, exact-target fallback rejection, local list counts, errors, limits, process cleanup, credential fallback, context, hooks and the fast version path. Synthetic `.env` fixtures are the only credential fixtures read by tests. No test logs in, deploys, runs remote commands, or reads real credentials. The skill freshness check fails if generated guidance is stale.

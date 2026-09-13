@@ -1,11 +1,11 @@
 import { runAxiCli, AxiError } from 'axi-sdk-js';
 import { encode as renderOutput } from '@toon-format/toon';
-import { AUTH_HELP, createClient, present } from './cloud.js';
-import { COMMAND_NAMES, DESCRIPTION, GUIDANCE, execute } from './commands.js';
+import { createCloud, present } from './cloud.js';
+import { COMMAND_NAMES, DESCRIPTION, GUIDANCE, RULES, execute } from './commands.js';
 
 export async function main(argv, options = {}) {
   const runtime = { cwd: process.cwd(), ...options };
-  runtime.client ??= createClient({ cwd: runtime.cwd, homeDir: runtime.homeDir });
+  runtime.cloud ??= createCloud({ cwd: runtime.cwd });
   await runAxiCli({
     argv,
     version: options.version ?? '0.1.0',
@@ -15,19 +15,22 @@ export async function main(argv, options = {}) {
       description: DESCRIPTION,
       commands: {
         app: 'list | view <id>',
-        environment: 'list --app <id> | view <id> | start <id> | stop <id>',
-        deployment: 'list --env <id> | view <id> | logs <id> | wait <id>',
-        deploy: '--env <id> (--dry-run | --confirm) [--wait]',
-        command: 'list --env <id> | view <id> | wait <id> | run --env <id> --command "..." (--dry-run | --confirm) [--wait]',
-        resources: 'instance | database (clusters) | cache | bucket | domain: list | view <id>',
-        logs: '--env <id> [--since 1h] [--query "..."]',
-        usage: '[--period 0..3] [--env <id>]',
-        auth: '[status]: check access and source; use cloud auth for login',
-        link: '--app <id> --env <id>: save read defaults for this project',
-        setup: 'hooks [--status|--remove]: opt-in session context for supported agents',
+        environment: 'list --app <id> | view <id>',
+        deployment: 'view <id> | wait <id>',
+        command: 'view <id> | wait <id>',
+        instance: 'view <id>',
+        domain: 'view <id>',
+        database: 'list | view <id> (clusters)',
+        cache: 'list | view <id>',
+        bucket: 'list | view <id>',
+        usage: '[--period 0..3]: organization billing',
+        auth: '[status]: check native access; never invokes login',
+        link: '--app <id> --env <id>: validate and save project read defaults',
+        setup: 'hooks [--status|--remove]: opt-in agent session context',
         home: 'Show live project state, also the default with no arguments',
       },
-      rules: [AUTH_HELP, 'IDs are exact, never guessed from names.', 'Read commands may use linked defaults. Mutations require explicit IDs and --confirm.', 'No automatic mutation retries. --full never reveals structured secrets.', 'Each command supports --help. Lists support --page and --all.'],
+      unsupported: ['deploy, command run, environment start/stop: no safe native write target guarantee', 'deployment/command/instance/domain list: cannot prove native scope and completeness', 'logs, deployment logs, usage --env: no safe equivalent'],
+      rules: RULES,
       examples: GUIDANCE.slice(0, 3),
     })}\n`,
     home: () => execute('home', [], runtime),
@@ -35,12 +38,9 @@ export async function main(argv, options = {}) {
     formatError: error => {
       const output = present({
         error: error instanceof AxiError ? error.message : 'Local operation failed. Check file permissions and project configuration.',
-        code: error.code ?? 'LOCAL_ERROR',
-        ...(error.httpStatus ? { http_status: error.httpStatus } : {}),
-        ...(error.details ? { details: error.details } : {}),
+        code: error instanceof AxiError ? error.code : 'LOCAL_ERROR',
         help: [...(error.result?.help ?? []), ...(error.suggestions ?? ['laravel-cloud-axi --help'])],
       });
-      // Operation results are already redacted and respect the caller's --full flag.
       return {
         output: `${renderOutput({ ...output, ...error.result, help: output.help })}\n`,
         exitCode: error.code === 'USAGE_ERROR' ? 2 : 1,

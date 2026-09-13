@@ -6,22 +6,19 @@ import { AxiError, installSessionStartHooks, sessionStartHookStatus, uninstallSe
 
 export function context(cwd = process.cwd()) {
   let directory = resolve(cwd);
-  while (true) {
-    const path = join(directory, '.cloud', 'config.json');
-    if (existsSync(path)) {
-      try {
-        const data = JSON.parse(readFileSync(path, 'utf8'));
-        if (!data || Array.isArray(data) || typeof data !== 'object') throw new Error();
-        return { directory, path, data };
-      } catch {
-        throw new AxiError(`Invalid project config: ${path}`, 'CONFIG_ERROR', ['Fix the JSON in .cloud/config.json.']);
-      }
-    }
-    if (existsSync(join(directory, '.git'))) return { directory, path, data: {} };
-    if (dirname(directory) === directory) {
-      return { directory: resolve(cwd), path: join(resolve(cwd), '.cloud', 'config.json'), data: {} };
-    }
+  // Match native LocalConfig: Git root (including worktree .git files), otherwise cwd.
+  while (!existsSync(join(directory, '.git'))) {
+    if (dirname(directory) === directory) { directory = resolve(cwd); break; }
     directory = dirname(directory);
+  }
+  const path = join(directory, '.cloud', 'config.json');
+  if (!existsSync(path)) return { directory, path, data: {} };
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    if (!data || Array.isArray(data) || typeof data !== 'object') throw new Error();
+    return { directory, path, data };
+  } catch {
+    throw new AxiError(`Invalid project config: ${path}`, 'CONFIG_ERROR', ['Fix the JSON in .cloud/config.json.']);
   }
 }
 

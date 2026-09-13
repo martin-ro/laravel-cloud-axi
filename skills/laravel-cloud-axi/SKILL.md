@@ -1,47 +1,45 @@
 ---
 name: laravel-cloud-axi
-description: Inspect Laravel Cloud apps, environments, deployments, logs, and billing, or run approved deployments and remote commands.
+description: Inspect Laravel Cloud apps, environments, resource details, existing operations and organization billing through the official CLI.
 ---
 
 # Laravel Cloud AXI
 
-Inspect Laravel Cloud resources, read logs, and run guarded deployment operations.
+Inspect Laravel Cloud through official commands with compact output and exact read targets.
 
-Use Node.js 22 or later. Run `npm ci` in the checkout first.
-Run `cloud auth` once for browser login with the official Cloud CLI. It owns login and credential storage.
-This CLI reuses that login. It does not implement a separate login or keyring, and does not need Secret Service.
-With no saved tokens, use `LARAVEL_CLOUD_API_TOKEN` from the environment, then from the project's `.env`.
-Use the directory containing `.cloud/config.json`, or the Git root when unlinked, or the current directory outside Git.
-Fallbacks do not change the process environment or execute shell commands. Invalid credentials do not switch to a lower-priority source.
-With multiple saved tokens, run `cloud repo:config` once in the project to select an organization.
-Run `laravel-cloud-axi auth` to check the source and organization. Use `cloud auth` again if the login expires.
-The official CLI stores tokens in `~/.config/cloud/config.json` as plaintext. Protect it; this CLI only reads it.
-Never print credentials or commit `.env` to Git. The old `LARAVEL_CLOUD_TOKEN` variable is not used.
-Replace `<checkout>` below with the absolute checkout path. A global install is not required.
+Use Node.js 22 or later and install the official Cloud CLI. Run `npm ci` in this checkout.
+Replace `<checkout>` with its absolute path. A global package install is not required.
+This package is not published to npm, so do not use an npx package example.
 
-Run `node <checkout>/bin/laravel-cloud-axi.js` to see live state.
-Run `node <checkout>/bin/laravel-cloud-axi.js --help` to discover commands.
+Run `node <checkout>/bin/laravel-cloud-axi.js` for live project state.
+Run `node <checkout>/bin/laravel-cloud-axi.js --help` for commands and compatibility limits.
 
 ```sh
-node <checkout>/bin/laravel-cloud-axi.js logs --env '<id>' --since '1h'
-node <checkout>/bin/laravel-cloud-axi.js deployment list --env '<id>'
+node <checkout>/bin/laravel-cloud-axi.js environment view <id>
+node <checkout>/bin/laravel-cloud-axi.js usage
 node <checkout>/bin/laravel-cloud-axi.js --help
 node <checkout>/bin/laravel-cloud-axi.js app list
 node <checkout>/bin/laravel-cloud-axi.js environment list --app <id>
-node <checkout>/bin/laravel-cloud-axi.js logs --env <id> --since 1h
-node <checkout>/bin/laravel-cloud-axi.js deploy --env <id> --dry-run
-node <checkout>/bin/laravel-cloud-axi.js deploy --env <id> --confirm --wait
-node <checkout>/bin/laravel-cloud-axi.js command run --env <id> --command "php artisan about" --confirm --wait
+node <checkout>/bin/laravel-cloud-axi.js deployment wait <id>
+node <checkout>/bin/laravel-cloud-axi.js command view <id>
 ```
 
-- Obtain user approval before a mutation. A command example is not approval.
-- Use exact resource IDs from list output. Never guess an application or environment.
-- Read commands can use `.cloud/config.json`. Mutations require explicit targets and `--confirm`.
-- `--dry-run` performs no API requests. Deploy and command run create a new operation on every confirmed call.
-- After an uncertain result, inspect the operation list. Do not repeat a mutation without checking.
-- Use `deployment wait <id>` or `command wait <id>` to resume waiting. A timeout does not cancel remote work.
-- Lists report count, total, page, and has_more. Use `--page` or `--all` for more results.
-- Use `--fields` to select fields and `--full` for complete text. Structured credentials stay redacted.
-- Logs and command output can contain secrets in free text. Do not share them without review.
-- Output is TOON. Exit codes: 0 success, 1 operational error, 2 invalid input.
-- Session hooks are optional. Install them only when asked, with `setup hooks` after `link --app <id> --env <id>`.
+- Run `cloud auth` yourself to save or renew login, then run `node <checkout>/bin/laravel-cloud-axi.js auth`. This tool never invokes login.
+- The official executable owns authentication and token storage. Native reads can remove expired saved tokens.
+- Saved login comes first. Only an explicit no-login error permits LARAVEL_CLOUD_API_TOKEN from the environment, then project .env, with native v0.6.0 or later.
+- Native v0.5.0 and v0.6.0 can attempt browser OAuth when all saved tokens expire. Closed stdin and noninteractive flags do not prevent that upstream behavior. This wrapper bounds each subprocess to 10 seconds; it cannot guarantee no native login attempt.
+- Use exact IDs. Native fields use camelCase. --fields selects fields; --full expands text, never structured secrets.
+- Supported lists default to 100 rows. --all shows the complete returned collection. Filters are local exact matches.
+- Remote writes, logs, environment billing and unsafe scoped history lists are unsupported. --dry-run only reports this limit; it cannot enable a write.
+- Read commands can use .cloud/config.json defaults. Link and hook setup are explicit, idempotent local writes.
+- Output is TOON. Exit codes: 0 success or local no-op, 1 failure, 2 invalid input.
+- Hooks are opt-in for Claude Code, Codex, and OpenCode. No session transcripts are collected.
+- Project scope is the Git root (including worktrees), otherwise the current directory. Parent .cloud configs outside Git are not used.
+- Never print credentials or commit .env. Native saved tokens are not read or copied by this wrapper.
+- Free text, command output, and logs can contain secrets. Review before sharing. Redaction is not a general secret scanner.
+- Obtain user approval before local link or hook setup. Examples are not approval.
+- Use `node <checkout>/bin/laravel-cloud-axi.js link --app <id> --env <id>` to save verified read defaults.
+- Install optional session context only when asked: `node <checkout>/bin/laravel-cloud-axi.js setup hooks`. Use a persistent install, not a temporary cache.
+- Setup supports Claude Code, Codex, and OpenCode. Codex setup also enables hooks in its user config.
+- Deployment, instance and domain IDs may be available in environment detail relationship fields. Command IDs must come from the Cloud dashboard.
+- Use `deployment wait <id>` or `command wait <id>` to monitor existing work. A deadline does not cancel remote work.

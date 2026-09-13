@@ -1,33 +1,42 @@
 import { parseArgs } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { AxiError } from 'axi-sdk-js';
-import { resource, present } from './cloud.js';
+import { resource, present, AUTH_GUIDANCE } from './cloud.js';
 import { context, saveContext, setupHooks } from './context.js';
 
-export const DESCRIPTION = 'Inspect Laravel Cloud resources, read logs, and run guarded deployment operations.';
+export const DESCRIPTION = 'Inspect Laravel Cloud through official commands with compact output and exact read targets.';
 export const GUIDANCE = [
   'laravel-cloud-axi app list',
   'laravel-cloud-axi environment list --app <id>',
-  'laravel-cloud-axi logs --env <id> --since 1h',
-  'laravel-cloud-axi deploy --env <id> --dry-run',
-  'laravel-cloud-axi deploy --env <id> --confirm --wait',
-  'laravel-cloud-axi command run --env <id> --command "php artisan about" --confirm --wait',
+  'laravel-cloud-axi environment view <id>',
+  'laravel-cloud-axi deployment wait <id>',
+  'laravel-cloud-axi command view <id>',
+  'laravel-cloud-axi usage',
+];
+export const RULES = [
+  ...AUTH_GUIDANCE,
+  'Use exact IDs. Native fields use camelCase. --fields selects fields; --full expands text, never structured secrets.',
+  'Supported lists default to 100 rows. --all shows the complete returned collection. Filters are local exact matches.',
+  'Remote writes, logs, environment billing and unsafe scoped history lists are unsupported. --dry-run only reports this limit; it cannot enable a write.',
+  'Read commands can use .cloud/config.json defaults. Link and hook setup are explicit, idempotent local writes.',
+  'Output is TOON. Exit codes: 0 success or local no-op, 1 failure, 2 invalid input.',
+  'Hooks are opt-in for Claude Code, Codex, and OpenCode. No session transcripts are collected.',
 ];
 
 const RESOURCES = {
-  app: { path: 'applications', fields: 'id,name,region,repository.full_name', filters: ['name', 'region', 'slug'] },
-  environment: { path: 'environments', parent: 'app', fields: 'id,name,status,vanity_domain', filters: ['name', 'status', 'slug'] },
-  deployment: { path: 'deployments', parent: 'env', fields: 'id,status,branch_name,commit_hash', filters: ['status', 'branch_name', 'commit_hash'] },
-  command: { path: 'commands', parent: 'env', fields: 'id,status,command,exit_code', filters: ['status', 'command'] },
-  instance: { path: 'instances', parent: 'env', fields: 'id,name,type,size', filters: ['name', 'type', 'size'] },
-  database: { path: 'databases/clusters', fields: 'id,name,type,status', filters: ['type', 'region', 'status'] },
-  cache: { path: 'caches', fields: 'id,name,type,status', filters: ['type', 'region', 'status'] },
-  bucket: { path: 'buckets', fields: 'id,name,status,visibility', filters: ['type', 'status', 'visibility'] },
-  domain: { path: 'domains', parent: 'env', fields: 'id,name,hostname_status,ssl_status', filters: ['name', 'hostname_status', 'ssl_status'] },
+  app: { native: 'application', fields: 'id,name,region,repositoryFullName', filters: ['name', 'region', 'slug'] },
+  environment: { native: 'environment', parent: 'app', fields: 'id,name,status,vanityDomain', filters: ['name', 'status', 'slug'] },
+  deployment: { native: 'deployment', parent: 'env', fields: 'id,status,branchName,commitHash', filters: ['status', 'branch_name', 'commit_hash'] },
+  command: { native: 'command', parent: 'env', fields: 'id,status,command,exitCode', filters: ['status', 'command'] },
+  instance: { native: 'instance', parent: 'env', fields: 'id,name,type,size', filters: ['name', 'type', 'size'] },
+  database: { native: 'database-cluster', fields: 'id,name,type,status', filters: ['type', 'region', 'status'] },
+  cache: { native: 'cache', fields: 'id,name,type,status', filters: ['type', 'region', 'status'] },
+  bucket: { native: 'bucket', fields: 'id,name,status,visibility', filters: ['type', 'status', 'visibility'] },
+  domain: { native: 'domain', parent: 'env', fields: 'id,name,hostnameStatus,sslStatus', filters: ['name', 'hostname_status', 'ssl_status'] },
 };
-const READ = { fields: 'Comma-separated field paths; default: compact list fields, all detail fields', full: 'Complete text; default: 1000 characters per string' };
+const READ = { fields: 'Comma-separated native camelCase field paths; default: compact lists, all detail fields', full: 'Complete text; default: 1000 characters per string' };
 const WAIT = { timeout: 'Wait deadline in seconds, 1..3600; default: 300' };
-const WRITE = { confirm: 'Required to send a mutation', 'dry-run': 'Preview the request without API calls' };
+const WRITE = { confirm: 'Legacy flag; remote writes are blocked', 'dry-run': 'Explain the blocked operation without a native call' };
 const BOOLEAN = new Set(['help', 'full', 'all', 'confirm', 'dry-run', 'wait', 'status', 'remove']);
 
 function usage(message, suggestions = []) {
@@ -38,6 +47,7 @@ function parse(args, name, flags = {}, positionals = 0, description = '') {
   const options = Object.fromEntries(Object.keys({ ...flags, help: '' }).map(key => [key, { type: BOOLEAN.has(key) ? 'boolean' : 'string' }]));
   // Filter flags named status are strings; only setup uses a boolean status flag.
   if (flags.status && name !== 'setup hooks') options.status.type = 'string';
+  if (args.some(arg => arg === '--page' || arg.startsWith('--page='))) usage('--page was removed. Lists now use --limit (default 100) or --all.', ['Run `laravel-cloud-axi ' + name + ' --help`.']);
   let parsed;
   try {
     parsed = parseArgs({ args, options, allowPositionals: true, strict: true, tokens: true });
@@ -53,26 +63,29 @@ function parse(args, name, flags = {}, positionals = 0, description = '') {
   for (const [key, value] of Object.entries(parsed.values)) {
     if (typeof value === 'string' && (!value.trim() || value.includes('\0'))) usage(`--${key} requires a non-empty value.`);
   }
-  const required = { deploy: ' --env <id>', 'command run': ' --env <id> --command "<command>"', link: ' --app <id> --env <id>' }[name] ?? '';
+  const required = { 'environment list': ' --app <id>', deploy: ' --env <id>', 'command run': ' --env <id> --command "<command>"', link: ' --app <id> --env <id>' }[name] ?? '';
   const example = `laravel-cloud-axi ${name}${positionals ? ' <id>' : ''}${required}`;
   const help = parsed.values.help ? {
     command: `laravel-cloud-axi ${name}${positionals ? ' <id>' : ''}`,
     description,
-    flags: { ...flags, help: 'Show this reference without API calls' },
+    flags: { ...flags, help: 'Show this reference without native calls' },
     examples: [
       `${example}${flags.confirm ? ' --dry-run' : ''}`,
-      `${example}${flags.confirm ? ' --confirm' : flags.all ? ' --all' : flags.full ? ' --full' : ' --help'}`,
+      `${example}${flags.confirm ? ' --help' : flags.all ? ' --all' : flags.full ? ' --full' : ' --help'}`,
     ],
   } : null;
   return { flags: parsed.values, args: parsed.positionals, help };
 }
 
+function discovery(name) {
+  if (name === 'command') return 'Use a command ID from the Cloud dashboard with `laravel-cloud-axi command view <id>`.';
+  const path = { deployment: 'environment view <id> --fields deploymentIds,currentDeploymentId', instance: 'environment view <id> --fields instances', domain: 'environment view <id> --fields domainIds' }[name]
+    ?? (name === '--env' || name.toLowerCase().includes('environment') ? 'environment list --app <id>' : RESOURCES[name] && !RESOURCES[name].parent ? `${name} list` : 'app list');
+  return `laravel-cloud-axi ${path}`;
+}
+
 function id(value, name) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{1,199}$/.test(value)) {
-    const hint = name === '--env' || name.toLowerCase().includes('environment') ? 'environment list --app <id>'
-      : RESOURCES[name]?.parent === 'env' ? `${name} list --env <id>` : 'app list';
-    usage(`${name} requires an exact resource ID.`, [`Run \`laravel-cloud-axi ${hint}\` to find IDs.`]);
-  }
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{1,199}$/.test(value)) usage(`${name} requires an exact resource ID.`, [discovery(name)]);
   return value;
 }
 
@@ -98,222 +111,183 @@ function scoped(flag, flags, runtime) {
   return id(flags[flag] ?? context(runtime.cwd).data[flag === 'app' ? 'application_id' : 'environment_id'], `--${flag}`);
 }
 
-function url(path, query) {
-  const search = new URLSearchParams(Object.entries(query).filter(([, value]) => value !== undefined));
-  return `${path}${search.size ? `?${search}` : ''}`;
-}
-
 function template(name, flags, overrides = {}) {
   const values = { ...flags, ...overrides };
   delete values.help;
   return `laravel-cloud-axi ${name}${Object.entries(values).filter(([, value]) => value !== undefined && value !== false).map(([key, value]) => value === true ? ` --${key}` : ` --${key} '${String(value).replaceAll("'", "'\\''")}'`).join('')}`;
 }
 
-export function homeGuidance(env) {
-  return [template('logs', { env, since: '1h' }), template('deployment list', { env }), 'laravel-cloud-axi --help'];
+export function homeGuidance() {
+  return ['laravel-cloud-axi environment view <id>', 'laravel-cloud-axi usage', 'laravel-cloud-axi --help'];
+}
+
+function unsupported(message, hint = 'laravel-cloud-axi --help') {
+  throw new AxiError(message, 'UNSUPPORTED', [hint]);
+}
+
+async function detail(noun, identifier, runtime, options) {
+  const value = resource(await runtime.cloud.json([`${RESOURCES[noun].native}:get`, identifier], options));
+  if (value.id !== identifier) throw new AxiError('Native resolution returned a different ID. Result withheld.', 'TARGET_MISMATCH', [discovery(noun)]);
+  return value;
+}
+
+function collection(value) {
+  if (!Array.isArray(value)) throw new AxiError('Expected a native collection.', 'INVALID_RESPONSE');
+  return value.map(item => resource(item));
 }
 
 async function listResource(noun, args, runtime) {
   const spec = RESOURCES[noun];
-  const options = { ...READ, page: 'API page number; default: 1', all: 'Read all pages from --page, maximum 100 pages', ...Object.fromEntries(spec.filters.map(key => [key, 'Server-side exact filter'])) };
+  const options = { ...READ, limit: 'Maximum displayed rows, 1..100000; default: 100', all: 'Show all returned rows; native lists already fetch all pages', ...Object.fromEntries(spec.filters.map(key => [key, 'Local exact filter'])) };
   if (spec.parent) options[spec.parent] = 'Resource ID; default: linked project';
-  const parsed = parse(args, `${noun} list`, options, 0, noun === 'database' ? 'List database clusters.' : `List ${noun} resources.`);
-  if (parsed.help) return parsed.help;
+  const unavailable = spec.parent === 'env';
+  const parsed = parse(args, `${noun} list`, options, 0, unavailable ? 'Unsupported: native list output cannot prove the resolved environment or complete scope. Use a known ID with view.' : `List ${noun === 'database' ? 'database clusters' : noun} resources.`);
+  if (parsed.help) {
+    if (unavailable) parsed.help.examples = noun === 'command'
+      ? ['laravel-cloud-axi command view <id>', 'laravel-cloud-axi command view <id> --full']
+      : [discovery(noun), `laravel-cloud-axi ${noun} view <id>`];
+    return parsed.help;
+  }
   const { flags } = parsed;
   const chosen = fields(flags.fields) ?? spec.fields.split(',');
-  const page = integer(flags.page, 'page', 1);
-  let path = spec.path;
-  if (spec.parent) {
-    const parent = scoped(spec.parent, flags, runtime);
-    flags[spec.parent] = parent;
-    path = `${spec.parent === 'app' ? 'applications' : 'environments'}/${parent}/${spec.path}`;
+  const limit = integer(flags.limit, 'limit', 100);
+  if (flags.all && flags.limit) usage('Use either --all or --limit.');
+  if (unavailable) {
+    if (flags.env) id(flags.env, '--env');
+    unsupported(`${noun} list cannot prove the native environment scope, including empty results. No read was sent.`, discovery(noun));
   }
-  const query = { page, ...Object.fromEntries(spec.filters.map(key => [`filter[${key}]`, flags[key]])) };
-  const result = await runtime.client.list(url(path, query), { all: flags.all });
+  const parent = spec.parent ? scoped(spec.parent, flags, runtime) : null;
+  let items;
+  if (noun === 'environment') {
+    const app = await detail('app', parent, runtime);
+    items = collection(app.environments);
+    if (!Array.isArray(app.environmentIds) || app.environmentIds.length !== items.length || items.some(item => !app.environmentIds.includes(item.id))) {
+      throw new AxiError('Included environments do not match the application relationship. Result withheld.', 'INVALID_RESPONSE');
+    }
+  } else items = collection(await runtime.cloud.json([`${spec.native}:list`]));
+  items = items.filter(item => spec.filters.every(key => flags[key] === undefined || item[key] === flags[key]));
+  const shown = flags.all ? items : items.slice(0, limit);
   const help = [`laravel-cloud-axi ${noun} view <id>`];
   if (noun === 'app') help.push('laravel-cloud-axi environment list --app <id>');
-  if (noun === 'environment') help.push('laravel-cloud-axi link --app <id> --env <id>');
-  if (result.has_more) help.push(template(`${noun} list`, flags, { page: result.page + 1 }));
+  if (noun === 'environment') help.push(template('link', { app: parent, env: '<id>' }));
+  if (shown.length < items.length) help.push(template(`${noun} list`, { ...flags, ...(parent ? { [spec.parent]: parent } : {}), limit: undefined, all: true }));
   return present({
-    count: result.items.length,
-    total: result.total,
-    page: result.page,
-    has_more: result.has_more,
-    ...(result.items.length ? {} : { message: `0 ${noun} results in this scope.` }),
-    [noun]: result.items.map(item => pick(item, chosen)),
-    help,
+    scope: parent ? `application ${parent}` : 'selected organization',
+    count: shown.length, total: items.length, has_more: shown.length < items.length,
+    ...(items.length ? {} : { message: `0 ${noun} results in this scope with the requested filters.` }),
+    [noun]: shown.map(item => pick(item, chosen)), help,
   }, flags);
 }
 
 const SUCCESS = { deployment: ['deployment.succeeded'], command: ['command.success'] };
 const FAILURE = { deployment: ['build.failed', 'deployment.failed', 'failed', 'cancelled'], command: ['command.failure'] };
 
-async function waitFor(noun, identifier, flags, runtime, initial) {
-  const seconds = integer(flags.timeout, 'timeout', 300, 3600);
-  const signal = AbortSignal.timeout(seconds * 1000);
-  let current = initial ?? { id: identifier };
-  const help = [`laravel-cloud-axi ${noun} wait <id> --timeout 300`];
+async function waitFor(noun, identifier, flags, runtime) {
+  const signal = AbortSignal.timeout(integer(flags.timeout, 'timeout', 300, 3600) * 1000);
+  let current = { id: identifier };
   try {
     while (true) {
-      current = resource((await runtime.client.request(`${RESOURCES[noun].path}/${identifier}`, { signal })).data);
-      if (SUCCESS[noun].includes(current.status) && (noun !== 'command' || current.exit_code == null || Number(current.exit_code) === 0)) {
-        return present({ [noun]: pick(current, fields(flags.fields)) }, flags);
-      }
-      if (FAILURE[noun].includes(current.status) || (noun === 'command' && current.exit_code != null && Number(current.exit_code) !== 0)) {
-        const error = new AxiError(`${noun} failed.`, 'OPERATION_FAILED', noun === 'deployment' ? ['laravel-cloud-axi deployment logs <id>'] : []);
-        error.result = present({ [noun]: current }, flags);
+      current = await detail(noun, identifier, runtime, { signal });
+      if (SUCCESS[noun].includes(current.status) && (noun !== 'command' || current.exitCode == null || current.exitCode === 0)) return present({ [noun]: pick(current, fields(flags.fields)) }, flags);
+      if (FAILURE[noun].includes(current.status) || (noun === 'command' && current.exitCode != null && current.exitCode !== 0)) {
+        const error = new AxiError(`${noun} failed.`, 'OPERATION_FAILED');
+        error.result = present({ [noun]: pick(current, fields(flags.fields)) }, flags);
         throw error;
       }
       await (runtime.sleep ?? sleep)(2000, undefined, { signal });
     }
   } catch (error) {
     if (error.code === 'OPERATION_FAILED') throw error;
-    const failure = new AxiError(signal.aborted ? 'Wait deadline reached. The remote operation continues.' : 'Could not read operation status. The remote operation may still be running.', signal.aborted ? 'WAIT_TIMEOUT' : 'WAIT_ERROR', [...(error.suggestions ?? []), ...help]);
-    failure.result = present({ [noun]: current }, flags);
+    const failure = new AxiError(signal.aborted ? 'Wait deadline reached. The remote operation continues.' : 'Could not read operation status. No operation was started or retried.', signal.aborted ? 'WAIT_TIMEOUT' : 'WAIT_ERROR', [...(error.suggestions ?? []), `laravel-cloud-axi ${noun} wait <id> --timeout 300`]);
+    failure.result = present({ [noun]: pick(current, fields(flags.fields)) }, flags);
     throw failure;
   }
 }
 
-async function mutate(noun, args, runtime) {
-  const isCommand = noun === 'command';
-  const name = isCommand ? 'command run' : 'deploy';
-  const parsed = parse(args, name, {
-    ...READ, ...WRITE, ...WAIT, env: 'Required explicit environment ID; never uses project defaults',
-    ...(isCommand ? { command: 'Required remote command as one quoted string' } : {}),
-    wait: 'Wait for success or failure; default: return the new operation ID',
-  }, 0, isCommand ? 'Run a remote command. Each confirmed call creates a new operation.' : 'Deploy the latest commit. Each confirmed call creates a new deployment.');
+function blockedWrite(name, args) {
+  const isCommand = name === 'command run';
+  const environmentAction = name.startsWith('environment ');
+  const parsed = parse(args, name, { ...READ, ...WRITE, ...(environmentAction ? {} : { ...WAIT, env: 'Required exact environment ID', wait: 'Legacy flag; cannot enable remote writes', ...(isCommand ? { command: 'Remote command as one quoted string' } : {}) }) }, environmentAction ? 1 : 0, 'Unsupported: native commands cannot guarantee exact write targets. Start and stop have no native command. Use the Cloud dashboard yourself.');
   if (parsed.help) return parsed.help;
   const { flags } = parsed;
-  const env = id(flags.env, '--env');
+  id(environmentAction ? parsed.args[0] : flags.env, '--env');
   fields(flags.fields);
   integer(flags.timeout, 'timeout', 300, 3600);
   if (isCommand && (!flags.command || flags.command.length > 150000)) usage('--command is required and must contain at most 150000 characters.');
-  if (flags.confirm && flags['dry-run']) usage('Use either --confirm or --dry-run, not both.');
+  if (flags.confirm && flags['dry-run']) usage('Use either --confirm or --dry-run.');
   if (flags['dry-run'] && flags.wait) usage('--wait cannot be used with --dry-run.');
   if (flags.timeout && !flags.wait) usage('--timeout requires --wait.');
-  if (!flags.confirm && !flags['dry-run']) usage('This operation requires --confirm or --dry-run.', [`laravel-cloud-axi ${name} --env <id>${isCommand ? ' --command "<command>"' : ''} --dry-run`]);
-  const path = `environments/${env}/${isCommand ? 'commands' : 'deployments'}`;
-  const body = isCommand ? { command: flags.command } : undefined;
-  if (flags['dry-run']) return present({ dry_run: true, method: 'POST', path, ...(body ? { body } : {}), warning: 'No request sent. Confirmation can change production and incur costs.' }, flags);
-  let result;
-  try {
-    result = resource((await runtime.client.request(path, { method: 'POST', body })).data);
-  } catch (error) {
-    error.suggestions = [...(error.suggestions ?? []), `laravel-cloud-axi ${isCommand ? 'command' : 'deployment'} list --env ${env}`, 'Check for an existing operation before repeating the request.'];
-    throw error;
-  }
-  const kind = isCommand ? 'command' : 'deployment';
-  if (flags.wait) return waitFor(kind, result.id, flags, runtime, result);
-  return present({ [kind]: pick(result, fields(flags.fields)), help: [`laravel-cloud-axi ${kind} wait <id>`, `laravel-cloud-axi ${kind} view <id>`] }, flags);
+  if (!flags.confirm && !flags['dry-run']) usage('Use --dry-run to inspect this unsupported operation. --confirm cannot enable it.');
+  if (flags['dry-run']) return { dry_run: true, supported: false, command: name, message: 'No subprocess started. Native target fallback makes writes unsafe; start and stop have no native command.', help: ['Use the Laravel Cloud dashboard yourself for this operation.'] };
+  unsupported(`${name} is not safe through native delegation. No operation was sent.`, 'Use the Laravel Cloud dashboard yourself for this operation.');
 }
 
-async function environmentAction(action, args, runtime) {
-  const parsed = parse(args, `environment ${action}`, { ...WRITE, full: READ.full }, 1, action === 'stop' ? 'Stop the environment and cancel active deployments.' : 'Start the environment and deploy its latest commit.');
+function logs(args) {
+  const parsed = parse(args, 'logs', { ...READ, env: 'Legacy environment ID', since: 'Legacy time window', from: 'Legacy start time', to: 'Legacy end time', type: 'Removed: native logs has no type filter', query: 'Removed: native logs has no text filter', cursor: 'Removed: native logs does not expose pagination' }, 0, 'Unsupported: native logs cannot prove the resolved environment or expose pagination. Use the Cloud dashboard for logs.');
   if (parsed.help) return parsed.help;
-  const { flags } = parsed;
-  const identifier = id(parsed.args[0], 'environment');
-  if (flags.confirm && flags['dry-run']) usage('Use either --confirm or --dry-run, not both.');
-  if (!flags.confirm && !flags['dry-run']) usage('This operation requires --confirm or --dry-run.');
-  const path = `environments/${identifier}/${action}`;
-  if (flags['dry-run']) return { dry_run: true, method: 'POST', path };
-  const current = resource((await runtime.client.request(`environments/${identifier}`)).data);
-  if ((action === 'stop' && current.status === 'stopped') || (action === 'start' && ['running', 'deploying'].includes(current.status))) {
-    return present({ changed: false, environment: current }, flags);
-  }
-  const result = resource((await runtime.client.request(path, { method: 'POST' })).data);
-  return present({ changed: true, [action === 'start' ? 'deployment' : 'environment']: result, help: [action === 'start' ? 'laravel-cloud-axi deployment wait <id>' : 'laravel-cloud-axi environment view <id>'] }, flags);
+  unsupported('Environment logs cannot prove exact scope or completeness through native delegation.', 'Use the Laravel Cloud dashboard yourself to inspect logs.');
 }
 
-async function logs(args, runtime) {
-  const parsed = parse(args, 'logs', {
-    ...READ, env: 'Environment ID; default: linked project', since: 'Time window, for example 30m, 1h, 2d; default: 1h',
-    from: 'ISO 8601 start time, instead of --since', to: 'ISO 8601 end time; default: now',
-    type: 'all, application, or access; default: application', query: 'Server-side text search', cursor: 'Next cursor from the previous response; keep the same time window',
-  }, 0, 'Read one page of environment logs. Total count is not supplied by the API.');
-  if (parsed.help) return parsed.help;
-  const { flags } = parsed;
-  const chosen = fields(flags.fields) ?? ['logged_at', 'level', 'type', 'message'];
-  if (flags.from && flags.since) usage('Use either --from or --since.');
-  if (flags.cursor && (!flags.from || !flags.to)) usage('--cursor requires the previous --from and --to values.');
-  const type = flags.type ?? 'application';
-  if (!['all', 'application', 'access'].includes(type)) usage('--type must be all, application, or access.');
-  const since = flags.since ?? '1h';
-  if (!/^\d+[mhd]$/.test(since) || Number(since.slice(0, -1)) < 1) usage('--since must be a positive number followed by m, h, or d.');
-  for (const key of ['from', 'to']) {
-    if (flags[key] && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.test(flags[key])) usage(`--${key} requires an ISO 8601 timestamp with a timezone.`);
-  }
-  const to = flags.to ? new Date(flags.to) : new Date();
-  const from = flags.from ? new Date(flags.from) : new Date(to.getTime() - Number(since.slice(0, -1)) * { m: 60000, h: 3600000, d: 86400000 }[since.at(-1)]);
-  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from >= to) usage('Log timestamps must be valid and --from must be before --to.');
-  const env = scoped('env', flags, runtime);
-  const range = { from: from.toISOString(), to: to.toISOString() };
-  const response = await runtime.client.request(url(`environments/${env}/logs`, { ...range, type, query: flags.query, cursor: flags.cursor }));
-  if (!Array.isArray(response.data)) throw new AxiError('Expected a log collection.', 'INVALID_RESPONSE');
-  const cursor = response.meta?.cursor || null;
-  return present({
-    count: response.data.length, total: null, ...range, has_more: Boolean(cursor), cursor,
-    ...(response.data.length ? {} : { message: '0 logs in this time window.' }),
-    logs: response.data.map(item => pick(item, chosen)),
-    ...(cursor ? { help: [template('logs', { ...flags, env, ...range, since: undefined, cursor })] } : {}),
-  }, flags);
-}
-
-export const COMMAND_NAMES = [...Object.keys(RESOURCES), 'deploy', 'logs', 'usage', 'auth', 'link', 'setup', 'home'];
+export const COMMAND_NAMES = [...Object.keys(RESOURCES), 'deploy', 'logs', 'usage', 'auth', 'link', 'setup', 'home', 'update'];
 
 export async function execute(command, args, runtime) {
-  if (command === 'deploy') return mutate('deployment', args, runtime);
-  if (command === 'logs') return logs(args, runtime);
+  if (command === 'deploy') return blockedWrite('deploy', args);
+  if (command === 'logs') return logs(args);
   if (RESOURCES[command]) {
     const action = args[0] && !args[0].startsWith('-') ? args.shift() : 'list';
-    if (command === 'command' && action === 'run') return mutate('command', args, runtime);
-    if (command === 'environment' && ['start', 'stop'].includes(action)) return environmentAction(action, args, runtime);
+    if (command === 'command' && action === 'run') return blockedWrite('command run', args);
+    if (command === 'environment' && ['start', 'stop'].includes(action)) return blockedWrite(`environment ${action}`, args);
     if (action === 'list') return listResource(command, args, runtime);
     const waiting = action === 'wait' && ['deployment', 'command'].includes(command);
     const deploymentLogs = command === 'deployment' && action === 'logs';
     if (action !== 'view' && !waiting && !deploymentLogs) usage(`Unknown action ${action} for ${command}.`, [`Run \`laravel-cloud-axi ${command} --help\`.`]);
-    const parsed = parse(args, `${command} ${action}`, { ...READ, ...(waiting ? WAIT : {}) }, 1, waiting ? 'Wait for the existing operation; never starts another one.' : 'Read resource details. Secrets remain redacted, including with --full.');
+    const parsed = parse(args, `${command} ${action}`, { ...READ, ...(waiting ? WAIT : {}) }, 1, deploymentLogs ? 'Unsupported: no native deployment logs command. Use the Cloud dashboard.' : waiting ? 'Wait for an existing operation. Never starts another operation.' : 'Read exact resource details. Native fallback to another ID is an error. Secrets remain redacted.');
     if (parsed.help) return parsed.help;
     const identifier = id(parsed.args[0], command);
     const chosen = fields(parsed.flags.fields);
+    if (deploymentLogs) unsupported('There is no native deployment logs command.', 'Use the Laravel Cloud dashboard yourself to inspect build and deployment logs.');
     if (waiting) return waitFor(command, identifier, parsed.flags, runtime);
-    const response = await runtime.client.request(`${RESOURCES[command].path}/${identifier}${deploymentLogs ? '/logs' : ''}`);
-    const data = deploymentLogs ? response.data : resource(response.data);
-    return present({ [deploymentLogs ? 'logs' : command]: pick(data, chosen), ...(deploymentLogs ? { status: response.meta?.deployment_status } : {}) }, parsed.flags);
+    return present({ [command]: pick(await detail(command, identifier, runtime), chosen) }, parsed.flags);
   }
   if (command === 'auth') {
-    if (['login', 'logout'].includes(args[0])) usage('The official Cloud CLI manages login and credentials.', ['Run `cloud auth` to log in.', 'laravel-cloud-axi auth --help']);
+    if (['login', 'logout'].includes(args[0])) usage('The official CLI owns login and credentials.', ['Run `cloud auth` yourself to log in.', 'laravel-cloud-axi auth --help']);
     if (args[0] === 'status') args.shift();
-    const parsed = parse(args, 'auth', {}, 0, 'Check credential source and organization. Run cloud auth for browser login; the official Cloud CLI owns credential storage. Fallback: LARAVEL_CLOUD_API_TOKEN in the environment, then .env.');
+    const parsed = parse(args, 'auth', {}, 0, 'Check access with a native application list, not a login command. Empty organizations cannot supply organization identity. See top-level help for native login limits.');
     if (parsed.help) return parsed.help;
-    const organization = resource((await runtime.client.request('meta/organization')).data);
-    return present({ ...runtime.client.authInfo, organization });
+    const apps = collection(await runtime.cloud.json(['application:list']));
+    const organizations = [...new Map(apps.filter(app => app.organization?.id).map(app => [app.organization.id, pick(app.organization, ['id', 'name'])])).values()];
+    return present({ authenticated: true, source: runtime.cloud.source, organizations, ...(organizations.length ? {} : { message: 'Access succeeded. No organization identity was returned.' }) });
   }
   if (command === 'usage') {
-    const parsed = parse(args, 'usage', { ...READ, period: '0=current, 1=previous, 2 or 3; default: 0', env: 'Optional environment ID; default: entire organization' }, 0, 'Read billing totals in integer cents.');
+    const parsed = parse(args, 'usage', { ...READ, period: '0=current, 1=previous, 2 or 3; default: 0', env: 'Unsupported: native environment billing cannot prove exact scope' }, 0, 'Read organization billing totals in integer cents. Environment billing is unsupported.');
     if (parsed.help) return parsed.help;
     const { flags } = parsed;
     if (flags.period && !/^[0-3]$/.test(flags.period)) usage('--period must be 0, 1, 2, or 3.');
-    if (flags.env) id(flags.env, '--env');
     const chosen = fields(flags.fields);
-    const response = await runtime.client.request(url('usage', { period: flags.period ?? 0, environment: flags.env }));
-    return present({ usage: pick(response.data, chosen ?? ['summary', 'application_totals.total_cost_cents', 'application_totals.application_count', 'resources.total_cost_cents', 'addons.total_cost_cents', ...(flags.env ? ['environment_usage'] : [])]), meta: response.meta }, flags);
+    if (flags.env) {
+      id(flags.env, '--env');
+      unsupported('Environment billing cannot prove the final native target.', 'laravel-cloud-axi usage');
+    }
+    const value = await runtime.cloud.json(['usage', `--period=${!flags.period || flags.period === '0' ? 'current' : flags.period}`]);
+    if (Array.isArray(value) || !Number.isInteger(value.currentSpendCents)) throw new AxiError('Expected native billing totals.', 'INVALID_RESPONSE');
+    return present({ usage: pick(value, chosen ?? ['currency', 'period', 'currentSpendCents', 'applicationCount', 'applicationsTotalCostCents', 'resourcesTotalCostCents', 'addonsTotalCostCents']) }, flags);
   }
   if (command === 'link') {
-    const parsed = parse(args, 'link', { app: 'Required application ID', env: 'Required environment ID' }, 0, 'Validate and save project defaults to .cloud/config.json. No token is saved.');
+    const parsed = parse(args, 'link', { app: 'Required application ID', env: 'Required environment ID' }, 0, 'Validate exact IDs and save project defaults to .cloud/config.json. No token is saved. Repeat calls are local no-ops.');
     if (parsed.help) return parsed.help;
     const app = id(parsed.flags.app, '--app');
     const env = id(parsed.flags.env, '--env');
     const current = context(runtime.cwd);
-    await runtime.client.request(`applications/${app}`, { ignoreProjectOrganization: true });
-    const environment = resource((await runtime.client.request(`environments/${env}?include=application`)).data);
-    if (environment.application_id !== app) usage('The environment does not belong to this application.');
-    const organization = resource((await runtime.client.request('meta/organization')).data).id;
+    const application = await detail('app', app, runtime);
+    const environment = await detail('environment', env, runtime);
+    if (environment.application?.id !== app) usage('The environment does not belong to this application.');
+    const organization = id(application.organization?.id ?? application.organizationId, 'Organization');
     return { changed: saveContext(current, app, env, organization), app, env, organization, config: current.path, help: ['laravel-cloud-axi', 'laravel-cloud-axi setup hooks'] };
   }
   if (command === 'setup') {
-    if (args.length === 1 && args[0] === '--help') return { command: 'laravel-cloud-axi setup hooks [--status|--remove]', description: 'Opt-in project hooks for Claude Code, Codex, and OpenCode. Codex also enables hooks in the user config.' };
+    if (args.length === 1 && args[0] === '--help') return { command: 'laravel-cloud-axi setup hooks [--status|--remove]', description: 'Opt-in project hooks for Claude Code, Codex, and OpenCode.', flags: { status: 'Inspect', remove: 'Remove managed hooks' }, examples: ['laravel-cloud-axi setup hooks', 'laravel-cloud-axi setup hooks --status', 'laravel-cloud-axi setup hooks --remove'] };
     if (args.shift() !== 'hooks') usage('Expected setup hooks.', ['laravel-cloud-axi setup hooks --help']);
-    const parsed = parse(args, 'setup hooks', { status: 'Inspect without writing', remove: 'Remove only managed hooks' }, 0, 'Install project session hooks. Also enables hooks in ~/.codex/config.toml. Requires a linked project and a persistent executable.');
+    const parsed = parse(args, 'setup hooks', { status: 'Inspect without writing', remove: 'Remove only managed hooks' }, 0, 'Install project session hooks. Also enables hooks in ~/.codex/config.toml. Requires a linked project and persistent executable.');
     if (parsed.help) return parsed.help;
     if (parsed.flags.status && parsed.flags.remove) usage('Use either --status or --remove.');
     return setupHooks(context(runtime.cwd), parsed.flags.status ? 'status' : parsed.flags.remove ? 'remove' : 'install', runtime.homeDir);
@@ -326,12 +300,14 @@ export async function execute(command, args, runtime) {
     const app = id(current.data.application_id, 'Linked application');
     if (!current.data.environment_id) return listResource('environment', ['--app', app], runtime);
     const env = id(current.data.environment_id, 'Linked environment');
-    const value = resource((await runtime.client.request(`environments/${env}?include=application,currentDeployment,instances`)).data);
-    if (value.application_id !== app) throw new AxiError('Linked environment no longer belongs to the linked application.', 'CONFIG_ERROR');
-    return present({
-      app, environment: pick(value, ['id', 'name', 'status', 'vanity_domain', 'current_deployment_id', 'instances_count']),
-      help: homeGuidance(env),
-    });
+    const value = await detail('environment', env, runtime);
+    if (value.application?.id !== app) throw new AxiError('Linked environment no longer belongs to the linked application.', 'CONFIG_ERROR');
+    return present({ app, environment: pick(value, ['id', 'name', 'status', 'vanityDomain', 'currentDeploymentId']), instances_count: Array.isArray(value.instances) ? value.instances.length : null, help: homeGuidance() });
+  }
+  if (command === 'update') {
+    const parsed = parse(args, 'update', {}, 0, 'Automatic package updates are not supported. Install a reviewed checkout yourself.');
+    if (parsed.help) return parsed.help;
+    unsupported('Automatic package updates are not supported.', 'Install a reviewed checkout with `npm install -g .` yourself.');
   }
   usage(`Unknown command ${command}.`, ['laravel-cloud-axi --help']);
 }
