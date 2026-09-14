@@ -142,7 +142,7 @@ test('unknown flags and invalid values fail before any dependency, even with hel
 });
 
 test('help and honest blocked dry runs have no subprocess', async () => {
-  const commands = [...reads.flatMap(noun => [[noun, 'list'], [noun, 'view']]), ['deploy'], ['command', 'run'], ['environment', 'start'], ['environment', 'stop'], ['deployment', 'wait'], ['command', 'wait'], ['deployment', 'logs'], ['logs'], ['usage'], ['auth'], ['auth', 'status'], ['link'], ['setup'], ['setup', 'hooks'], ['home'], ['update']];
+  const commands = [...reads.flatMap(noun => [[noun, 'list'], [noun, 'view']]), ['deploy'], ['command', 'run'], ['environment', 'start'], ['environment', 'stop'], ['deployment', 'wait'], ['command', 'wait'], ['deployment', 'logs'], ['logs'], ['usage'], ['link'], ['setup'], ['setup', 'hooks'], ['home'], ['update']];
   for (const argv of commands) {
     const result = await run([...argv, '--help']);
     assert.equal(result.code, 0, result.text);
@@ -215,13 +215,13 @@ test('native failures, stderr, malformed JSON and progress JSON lines are never 
     { stderr: JSON.stringify({ error: true, message: 'API token rejected 401 synthetic-secret' }), code: 1 },
     { stdout: '[]', stderr: 'warning synthetic-secret' },
   ]) {
-    const result = await run(['auth'], [response]);
+    const result = await run(['app', 'list'], [response]);
     assert.equal(result.code, 1);
     assert.ok(result.data.code);
     assert.ok(!result.text.includes('synthetic-secret'));
     assert.equal(result.calls.length, 1);
   }
-  const missing = await run(['auth'], [], { cloudOptions: { binary: '/does-not-exist/cloud' } });
+  const missing = await run(['app', 'list'], [], { cloudOptions: { binary: '/does-not-exist/cloud' } });
   assert.equal(missing.data.code, 'DEPENDENCY_ERROR');
 });
 
@@ -230,7 +230,7 @@ test('ambiguous native login directs organization selection without retrying or 
     'Multiple API tokens found. Set organization_id in .cloud/config.json or use `cloud auth:token` to manage tokens.',
     'Multiple API tokens found. Run `cloud repo:config --organization=<id|name|slug>` to set a default for this repository, or use `cloud auth:token` to manage tokens.',
   ]) {
-    const result = await run(['auth'], [{ stderr: `${JSON.stringify({ error: true, message })}\n`.repeat(2), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'unused-fallback' } });
+    const result = await run(['app', 'list'], [{ stderr: `${JSON.stringify({ error: true, message })}\n`.repeat(2), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'unused-fallback' } });
     assert.equal(result.code, 1);
     assert.equal(result.data.code, 'AUTH_AMBIGUOUS');
     assert.match(result.text, /cloud repo:config/);
@@ -245,10 +245,10 @@ test('hard time and output bounds stop the native process and child process grou
   const root = mkdtempSync(join(tmpdir(), 'cloud-axi-kill-'));
   try {
     const marker = join(root, 'child-survived');
-    const slow = await run(['auth'], [{ delay: 5000, childMarker: marker }], { cloudOptions: { timeout: 200 } });
+    const slow = await run(['app', 'list'], [{ delay: 5000, childMarker: marker }], { cloudOptions: { timeout: 200 } });
     assert.equal(slow.data.code, 'READ_TIMEOUT');
     assert.equal(slow.calls.length, 1);
-    const large = await run(['auth'], [{ bytes: 50000 }], { cloudOptions: { maxBytes: 1000 } });
+    const large = await run(['app', 'list'], [{ bytes: 50000 }], { cloudOptions: { maxBytes: 1000 } });
     assert.equal(large.data.code, 'RESPONSE_TOO_LARGE');
     assert.equal(large.calls.length, 1);
     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -257,26 +257,24 @@ test('hard time and output bounds stop the native process and child process grou
 });
 
 test('saved native login remains first; only exact no-login permits a v0.6 environment fallback', async () => {
-  const saved = await run(['auth'], [[app()]], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
-  assert.equal(saved.data.source, 'cloud-cli');
+  const saved = await run(['app', 'list'], [[app()]], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
   assert.equal(saved.calls.length, 1);
   assert.equal(saved.calls[0].env.LARAVEL_CLOUD_TOKEN, undefined);
-  const result = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  const result = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
   assert.equal(result.code, 0, result.text);
-  assert.equal(result.data.source, 'environment');
   assert.equal(result.calls[0].env.LARAVEL_CLOUD_TOKEN, undefined);
   assert.deepEqual(result.calls[1].argv, ['--version']);
   assert.equal(result.calls[2].env.LARAVEL_CLOUD_TOKEN, 'synthetic-token');
   assert.deepEqual(result.calls[0].argv, result.calls[2].argv);
-  const old = await run(['auth'], [noLogin, { stdout: 'Cloud v0.5.0' }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  const old = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.5.0' }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
   assert.equal(old.data.code, 'FALLBACK_UNSUPPORTED');
   assert.equal(old.calls.length, 2);
-  const rejected = await run(['auth'], [{ stderr: JSON.stringify({ error: true, message: 'API token rejected 401' }), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  const rejected = await run(['app', 'list'], [{ stderr: JSON.stringify({ error: true, message: 'API token rejected 401' }), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
   assert.equal(rejected.data.code, 'AUTH_REQUIRED');
   assert.equal(rejected.calls.length, 1);
-  const mixed = await run(['auth'], [{ ...noLogin, stderr: `${noLogin.stderr}{"error":true,"message":"other failure"}\n` }]);
+  const mixed = await run(['app', 'list'], [{ ...noLogin, stderr: `${noLogin.stderr}{"error":true,"message":"other failure"}\n` }]);
   assert.equal(mixed.calls.length, 1);
-  const deniedFallback = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, { stderr: JSON.stringify({ error: true, message: '401 rejected' }), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
+  const deniedFallback = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.6.0' }, { stderr: JSON.stringify({ error: true, message: '401 rejected' }), code: 1 }], { env: { LARAVEL_CLOUD_API_TOKEN: 'synthetic-token' } });
   assert.equal(deniedFallback.calls.length, 3);
   assert.equal(deniedFallback.code, 1);
 });
@@ -292,9 +290,8 @@ test('project .env fallback uses synthetic fixtures only, stays read-only and ne
   const modified = statSync(path).mtimeMs;
   const previous = process.env.LARAVEL_CLOUD_TOKEN;
   try {
-    const fallback = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { cwd: join(cwd, 'sub') });
+    const fallback = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { cwd: join(cwd, 'sub') });
     assert.equal(fallback.code, 0, fallback.text);
-    assert.equal(fallback.data.source, 'dotenv');
     assert.equal(fallback.calls[2].env.LARAVEL_CLOUD_TOKEN, 'synthetic-dotenv');
     assert.equal(fallback.calls[2].cwd, cwd);
     assert.equal(readFileSync(path, 'utf8'), content);
@@ -303,15 +300,15 @@ test('project .env fallback uses synthetic fixtures only, stays read-only and ne
     assert.equal(existsSync(join(cwd, '.config')), false);
     assert.equal(existsSync(join(cwd, 'must-not-exist')), false);
     writeFileSync(path, 'LARAVEL_CLOUD_API_TOKEN="invalid token"');
-    const invalid = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }], { cwd });
+    const invalid = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.6.0' }], { cwd });
     assert.equal(invalid.data.code, 'AUTH_INVALID');
     assert.equal(invalid.calls.length, 1);
     rmSync(path);
-    const absent = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }], { cwd });
+    const absent = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.6.0' }], { cwd });
     assert.equal(absent.data.code, 'AUTH_REQUIRED');
     mkdirSync(path);
-    assert.equal((await run(['auth'], [[app()]], { cwd })).code, 0, 'Saved login must not inspect .env.');
-    assert.equal((await run(['auth', '--help'], [], { cwd })).code, 0);
+    assert.equal((await run(['app', 'list'], [[app()]], { cwd })).code, 0, 'Saved login must not inspect .env.');
+    assert.equal((await run(['app', 'list', '--help'], [], { cwd })).code, 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -340,10 +337,16 @@ test('native usage maps billing periods and real camelCase totals', async () => 
   const selected = await run(['usage', '--period', '2', '--fields', 'currency,currentSpendCents'], [{ currency: 'USD', currentSpendCents: 42 }]);
   assert.deepEqual(selected.calls[0].argv.slice(0, 2), ['usage', '--period=2']);
   assert.equal(Object.keys(selected.data.usage).length, 2);
-  const empty = await run(['auth'], [[]]);
-  assert.equal(empty.data.authenticated, true);
-  assert.deepEqual(empty.data.organizations, []);
-  assert.match(empty.data.message, /No organization identity/);
+});
+
+test('auth is not a wrapper command', async () => {
+  for (const argv of [['auth'], ['auth', 'status'], ['auth', 'login'], ['auth', '--help']]) {
+    const result = await run(argv);
+    assert.equal(result.code, 2, `${argv.join(' ')}: ${result.text}`);
+    assert.equal(result.calls.length, 0);
+    assert.match(result.text, /cloud auth/);
+    assert.match(result.text, /app list/);
+  }
 });
 
 test('context, exact linked home and idempotent local link preserve unrelated settings', async () => {
@@ -455,7 +458,7 @@ test('native scope ignores nested project config and parent configs outside Git'
     writeFileSync(join(repo, '.env'), 'LARAVEL_CLOUD_API_TOKEN=root-synthetic');
     writeFileSync(join(sub, '.env'), 'LARAVEL_CLOUD_API_TOKEN=nested-synthetic');
     assert.equal(context(sub).data.application_id, 'app-root');
-    const fallback = await run(['auth'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { cwd: sub });
+    const fallback = await run(['app', 'list'], [noLogin, { stdout: 'Cloud v0.6.0' }, [app()]], { cwd: sub });
     assert.equal(fallback.calls[2].cwd, repo);
     assert.equal(fallback.calls[2].env.LARAVEL_CLOUD_TOKEN, 'root-synthetic');
     const plain = join(root, 'plain');
@@ -465,7 +468,7 @@ test('native scope ignores nested project config and parent configs outside Git'
     writeFileSync(join(root, '.env'), 'LARAVEL_CLOUD_API_TOKEN=parent-synthetic');
     assert.equal(context(plain).directory, plain);
     assert.deepEqual(context(plain).data, {});
-    const noFallback = await run(['auth'], [noLogin], { cwd: plain });
+    const noFallback = await run(['app', 'list'], [noLogin], { cwd: plain });
     assert.equal(noFallback.data.code, 'AUTH_REQUIRED');
     assert.equal(noFallback.calls.length, 1, 'No fallback needs no version probe or upgrade.');
     const worktree = join(root, 'worktree');
@@ -483,10 +486,10 @@ test('the executable uses CLOUD_BIN, structured stdout, and no real credentials'
     chmodSync(binary, 0o700);
     writeFileSync(join(root, 'steps.json'), JSON.stringify([{ stdout: JSON.stringify([app()]) }]));
     const env = { PATH: process.env.PATH, HOME: root, USERPROFILE: root, CLOUD_BIN: binary };
-    const child = spawnSync(process.execPath, [bin, 'auth'], { cwd: root, env, encoding: 'utf8', timeout: 5000 });
+    const child = spawnSync(process.execPath, [bin, 'app', 'list'], { cwd: root, env, encoding: 'utf8', timeout: 5000 });
     assert.equal(child.status, 0, child.stdout);
     assert.equal(child.stderr, '');
-    assert.equal(decode(child.stdout).source, 'cloud-cli');
+    assert.equal(decode(child.stdout).app[0].id, 'app-1');
     assert.equal(existsSync(join(root, '.config')), false);
     assert.equal(existsSync(join(root, '.cloud')), false);
     const calls = readFileSync(join(root, 'calls.jsonl'), 'utf8');

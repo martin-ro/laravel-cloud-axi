@@ -22,11 +22,10 @@ Log in yourself, outside an agent session:
 
 ```sh
 cloud auth
-laravel-cloud-axi auth
-laravel-cloud-axi
+laravel-cloud-axi app list
 ```
 
-`auth` and `auth status` check access through `application:list`. They never invoke `auth` or `auth:token`. They report the source and organization identities returned with applications. An empty organization can pass the access check without returning its identity.
+This wrapper has no `auth` command. Login, logout and token storage belong to `cloud auth`. Any supported read, including `app list` or no-argument home, is the access check.
 
 Credential order:
 
@@ -40,7 +39,11 @@ No saved login and no fallback means `AUTH_REQUIRED`. With a fallback but native
 
 **Upstream safety limit:** native v0.5.0 and v0.6.0 can start OAuth and open a browser when all stored tokens expire. Closed stdin, CI mode and `--no-interaction` do not prevent that branch. Agent-detection environment markers are withheld, but native detection can also use files. Each subprocess has a 10-second hard deadline and process cleanup. This bounds waiting; it does not guarantee that native login or a browser cannot start. The wrapper does not implement a second authentication system to work around this provider behavior.
 
-The official CLI owns token selection and storage. It can remove expired saved tokens during ordinary reads. This wrapper does not read, copy or write the saved credential file, and cannot promise that the provider leaves it unchanged. With multiple saved tokens, run `cloud repo:config` yourself in a Git project to select the organization. Outside Git, set `organization_id` in `.cloud/config.json`. Native single-token selection does not assert a saved organization ID. Use read-only credentials where possible.
+The official CLI owns token selection and storage. It can remove expired saved tokens during ordinary reads. This wrapper does not read, copy or write the saved credential file, and cannot promise that the provider leaves it unchanged.
+
+Native login is not organization-agnostic. `~/.config/cloud/config.json` can store several tokens. Project `.cloud/config.json` stores one `organization_id`, not a list. With one valid token, native uses it. With several valid tokens, native uses the token whose organization matches that single ID. If the ID is missing or matches none of the tokens, native fails and this wrapper returns `AUTH_AMBIGUOUS`. It does not prompt, pick another token, or retry with fallback credentials.
+
+First-time multi-token setup is `cloud repo:config` in a Git project, or write `organization_id` yourself. `link` cannot bootstrap that selection: the application read already needs a chosen token. After a successful read, `link` copies the application's organization ID into that native key so later reads in the same project keep the same organization. Use read-only credentials where possible.
 
 ## Supported commands
 
@@ -59,8 +62,7 @@ Every subcommand has concise `--help` with flags and examples. Unknown flags are
 | `cache list`, `cache view <id>` | `cache:list`, `cache:get <id>` |
 | `bucket list`, `bucket view <id>` | `bucket:list`, `bucket:get <id>` |
 | `usage --period 0` | `usage --period=current`, organization billing |
-| `auth`, `auth status` | Access check with `application:list` |
-| `link --app <id> --env <id>` | Exact application and environment reads, then local config write |
+| `link --app <id> --env <id>` | Exact application and environment reads, then local `organization_id`, application and environment defaults |
 | `setup hooks [--status\|--remove]` | Opt-in local agent configuration |
 
 A noun without an action selects its list. `home` and no arguments show live state. Linked home shows the environment, current deployment ID and available instance count. Unlinked home lists applications. No-argument output includes the executable path and a short description. Bare `-v`, `-V`, and `--version` load no command graph and print only the package version.
@@ -76,7 +78,7 @@ laravel-cloud-axi
 
 Scope matches native `LocalConfig`: the Git root, including worktree `.git` files, otherwise the current directory. Nested `.cloud` files inside Git and parent configs outside Git are not used. Native subprocesses run in this same directory. `.env`, link, read defaults and hooks use this scope too.
 
-`link` validates both returned IDs, environment membership and the application's organization ID before saving `.cloud/config.json`. Other keys are preserved. The write is atomic with mode `0600`. An unchanged link is a local no-op. It does not change credential storage or override native organization selection. Explicit read flags override linked target IDs.
+`link` validates both returned IDs, environment membership and the application's organization ID before saving `.cloud/config.json`. That `organization_id` is the native token selector when several logins exist. Other keys are preserved. The write is atomic with mode `0600`. An unchanged link is a local no-op. Explicit read flags override linked target IDs.
 
 ### Output
 
@@ -106,6 +108,7 @@ This is a reduced, read-focused surface, not feature parity.
 | Direct API calls without PHP or `cloud` | Official executable and its runtime are required |
 | Environment/.env fallback with any native version | Requires v0.6.0, only after an explicit no-saved-login result |
 | Wrapper selected saved tokens and asserted organization | Native CLI owns token and organization selection |
+| `auth`, `auth status` | Removed: run `cloud auth`, then `laravel-cloud-axi app list` |
 | API snake_case `--fields` | Native camelCase, for example `repositoryFullName`, `exitCode`, `currentDeploymentId` |
 | `--page` | Targeted usage error: use `--limit` or `--all` |
 | Server-side list filters | Local exact filters on complete supported collections |

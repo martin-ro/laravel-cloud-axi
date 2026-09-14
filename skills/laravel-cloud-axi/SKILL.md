@@ -24,7 +24,7 @@ node <checkout>/bin/laravel-cloud-axi.js deployment wait <id>
 node <checkout>/bin/laravel-cloud-axi.js command view <id>
 ```
 
-- Run `cloud auth` yourself to save or renew login, then run `node <checkout>/bin/laravel-cloud-axi.js auth`. This tool never invokes login.
+- Run `cloud auth` yourself to save or renew login. This tool never invokes login.
 - The official executable owns authentication and token storage. Native reads can remove expired saved tokens.
 - Saved login comes first. Only an explicit no-login error permits LARAVEL_CLOUD_API_TOKEN from the environment, then project .env, with native v0.6.0 or later.
 - Native v0.5.0 and v0.6.0 can attempt browser OAuth when all saved tokens expire. Closed stdin and noninteractive flags do not prevent that upstream behavior. This wrapper bounds each subprocess to 10 seconds; it cannot guarantee no native login attempt.

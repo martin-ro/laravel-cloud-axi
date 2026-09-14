@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { context } from './context.js';
 
-export const AUTH_HELP = 'Run `cloud auth` yourself to save or renew login, then run `laravel-cloud-axi auth`. This tool never invokes login.';
+export const AUTH_HELP = 'Run `cloud auth` yourself to save or renew login. This tool never invokes login.';
 export const AUTH_GUIDANCE = [
   AUTH_HELP,
   'The official executable owns authentication and token storage. Native reads can remove expired saved tokens.',
@@ -47,7 +47,6 @@ function nativeError(stderr) {
 export function createCloud({ cwd = process.cwd(), env = process.env, binary = env.CLOUD_BIN || 'cloud', timeout = 10000, maxBytes = 5 * 1024 * 1024 } = {}) {
   const environment = childEnvironment(env);
   let fallback;
-  let source = 'cloud-cli';
 
   function run(args, signal, token) {
     return new Promise((resolve, reject) => {
@@ -71,7 +70,7 @@ export function createCloud({ cwd = process.cwd(), env = process.env, binary = e
         else output[channel].push(chunk);
       });
       child.on('error', error => {
-        failure = new AxiError(error.code === 'ENOENT' ? 'Cloud executable not found.' : 'Could not start the Cloud executable.', 'DEPENDENCY_ERROR', ['Install the official CLI and run `laravel-cloud-axi auth`. CLOUD_BIN can select its executable path.']);
+        failure = new AxiError(error.code === 'ENOENT' ? 'Cloud executable not found.' : 'Could not start the Cloud executable.', 'DEPENDENCY_ERROR', ['Install the official CLI and run `cloud auth`. CLOUD_BIN can select its executable path.']);
       });
       child.on('close', code => {
         clearTimeout(timer);
@@ -89,7 +88,6 @@ export function createCloud({ cwd = process.cwd(), env = process.env, binary = e
     let result = await run(argv, signal, fallback);
     const message = nativeError(result.stderr);
     if (!fallback && !result.stdout && NO_LOGIN.has(message)) {
-      source = env.LARAVEL_CLOUD_API_TOKEN ? 'environment' : 'dotenv';
       fallback = env.LARAVEL_CLOUD_API_TOKEN;
       if (!fallback) {
         try { fallback = parseEnv(readFileSync(join(context(cwd).directory, '.env'), 'utf8')).LARAVEL_CLOUD_API_TOKEN; } catch (error) {
@@ -100,7 +98,7 @@ export function createCloud({ cwd = process.cwd(), env = process.env, binary = e
       if (typeof fallback !== 'string' || fallback.length > 4096 || /[^\x21-\x7e]/.test(fallback)) throw new AxiError('Invalid API-token fallback.', 'AUTH_INVALID', [AUTH_HELP]);
       const version = await run(['--version'], signal);
       if (version.code !== 0 || version.stderr || !/^Cloud v?0\.(?:[6-9]|[1-9]\d+)\.\d+$/.test(version.stdout)) {
-        throw new AxiError('No saved login. API-token fallback requires native Cloud v0.6.0 or later in the 0.x series.', 'FALLBACK_UNSUPPORTED', [AUTH_HELP, 'Upgrade the official CLI yourself, then run `laravel-cloud-axi auth`.']);
+        throw new AxiError('No saved login. API-token fallback requires native Cloud v0.6.0 or later in the 0.x series.', 'FALLBACK_UNSUPPORTED', [AUTH_HELP, 'Upgrade the official CLI yourself.']);
       }
       result = await run(argv, signal, fallback);
     }
@@ -116,12 +114,12 @@ export function createCloud({ cwd = process.cwd(), env = process.env, binary = e
     let value;
     try { value = JSON.parse(result.stdout); } catch {
       // Reads return one document. Do not treat progress JSON lines as a successful result.
-      throw new AxiError('Expected one JSON document from the native read.', 'INVALID_RESPONSE', ['Check the official CLI version, then run `laravel-cloud-axi auth`.']);
+      throw new AxiError('Expected one JSON document from the native read.', 'INVALID_RESPONSE', ['Check the official CLI version, then run `laravel-cloud-axi app list`.']);
     }
     if (!value || typeof value !== 'object' || value.error) throw new AxiError('Invalid native read result.', 'INVALID_RESPONSE');
     return clean(value, [env.LARAVEL_CLOUD_API_TOKEN, fallback]);
   }
-  return { json, get source() { return source; } };
+  return { json };
 }
 
 export function resource(value) {

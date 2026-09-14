@@ -249,15 +249,7 @@ export async function execute(command, args, runtime) {
     if (waiting) return waitFor(command, identifier, parsed.flags, runtime);
     return present({ [command]: pick(await detail(command, identifier, runtime), chosen) }, parsed.flags);
   }
-  if (command === 'auth') {
-    if (['login', 'logout'].includes(args[0])) usage('The official CLI owns login and credentials.', ['Run `cloud auth` yourself to log in.', 'laravel-cloud-axi auth --help']);
-    if (args[0] === 'status') args.shift();
-    const parsed = parse(args, 'auth', {}, 0, 'Check access with a native application list, not a login command. Empty organizations cannot supply organization identity. See top-level help for native login limits.');
-    if (parsed.help) return parsed.help;
-    const apps = collection(await runtime.cloud.json(['application:list']));
-    const organizations = [...new Map(apps.filter(app => app.organization?.id).map(app => [app.organization.id, pick(app.organization, ['id', 'name'])])).values()];
-    return present({ authenticated: true, source: runtime.cloud.source, organizations, ...(organizations.length ? {} : { message: 'Access succeeded. No organization identity was returned.' }) });
-  }
+  if (command === 'auth') usage('Login belongs to the official CLI. This wrapper does not implement auth.', ['Run `cloud auth` yourself.', 'laravel-cloud-axi app list']);
   if (command === 'usage') {
     const parsed = parse(args, 'usage', { ...READ, period: '0=current, 1=previous, 2 or 3; default: 0', env: 'Unsupported: native environment billing cannot prove exact scope' }, 0, 'Read organization billing totals in integer cents. Environment billing is unsupported.');
     if (parsed.help) return parsed.help;
@@ -273,7 +265,7 @@ export async function execute(command, args, runtime) {
     return present({ usage: pick(value, chosen ?? ['currency', 'period', 'currentSpendCents', 'applicationCount', 'applicationsTotalCostCents', 'resourcesTotalCostCents', 'addonsTotalCostCents']) }, flags);
   }
   if (command === 'link') {
-    const parsed = parse(args, 'link', { app: 'Required application ID', env: 'Required environment ID' }, 0, 'Validate exact IDs and save project defaults to .cloud/config.json. No token is saved. Repeat calls are local no-ops.');
+    const parsed = parse(args, 'link', { app: 'Required application ID', env: 'Required environment ID' }, 0, 'Validate exact IDs and save native .cloud/config.json defaults, including organization_id from the application. No token is saved. Repeat calls are local no-ops.');
     if (parsed.help) return parsed.help;
     const app = id(parsed.flags.app, '--app');
     const env = id(parsed.flags.env, '--env');
